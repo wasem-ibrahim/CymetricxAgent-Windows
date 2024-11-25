@@ -1,0 +1,42 @@
+# Ignore text files
+*.txt
+
+# Ignore database files
+*.db
+
+# Ignore executable files
+*.exe
+
+# Ignore specific Go files
+main2.go
+*_test.go
+test_registry.go
+
+# Ignore log files
+*.log
+errors.log
+logs
+
+# Ignore configuration files
+configCymetricxAgent.json
+*.ini
+
+# Ignore batch files
+*.bat
+
+# Ignore PowerShell scripts
+*.ps1
+
+# Ignore profiling files
+*.pprof
+
+# Ignore Python files
+*.py
+
+# Ignore VSCode settings
+# .vscode
+
+# Ignore specific directories
+cymetricxAgentFiles
+Compressed Files
+Cymetricx Agent Files
