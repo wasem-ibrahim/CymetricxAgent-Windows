@@ -9,7 +9,7 @@ require (
 	github.com/rs/zerolog v1.30.0
 	github.com/shirou/gopsutil v3.21.11+incompatible
 	github.com/shirou/gopsutil/v3 v3.23.8
-	golang.org/x/sys v0.12.0
+	golang.org/x/sys v0.27.0
 )
 
 require (

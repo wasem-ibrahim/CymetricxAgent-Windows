@@ -1929,9 +1929,399 @@ func startGoRoutines(iniData ini.IniConfig, serialNumber string, cmdFlags CMDFla
 	go scanActiveDirectoryAndLGPOAndUploadThem()
 	go startInitialFullSystemDataAndDetailsScan()
 	go startPeriodicUploadLogs()
-	checkingUSNPeriodecly()
+	go checkingUSNPeriodecly()
+	go watchDNSFile()
+	go monitorAndDetectChangesForLocalUsers()
+	go monitorInstalledUninstalledApplications()
+	go monitorNetworkInterfaces()
 
 	log.Info().Msg("Successfully started the go routines.")
+}
+
+func monitorNetworkInterfaces() {
+	// Place holder function:
+	upload2 := func(changes []string) {
+		fmt.Println("Changes detected:")
+		for _, change := range changes {
+			fmt.Println(" -", change)
+		}
+	}
+
+	previousState, err := getInterfacesState()
+	if err != nil {
+		log.Error().Err(err).Msg("Error getting initial state")
+		return
+	}
+
+	for {
+		currentState, err := getInterfacesState()
+		if err != nil {
+			log.Error().Err(err).Msg("Error getting current state")
+			continue
+		}
+
+		changes := compareStates(previousState, currentState)
+		if len(changes) > 0 {
+			upload2(changes)
+		}
+
+		previousState = currentState
+		time.Sleep(2 * time.Second) // Poll every 2 seconds
+	}
+}
+
+func getInterfacesState() (map[string]InterfaceState, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	state := make(map[string]InterfaceState)
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return nil, err
+		}
+
+		var ips []string
+		for _, addr := range addrs {
+			ip, _, err := net.ParseCIDR(addr.String())
+			if err == nil {
+				ips = append(ips, ip.String())
+			}
+		}
+
+		state[iface.Name] = InterfaceState{IPs: ips}
+	}
+
+	return state, nil
+}
+
+func compareStates(oldState, newState map[string]InterfaceState) []string {
+	var changes []string
+
+	for name, newIface := range newState {
+		oldIface, exists := oldState[name]
+		if !exists {
+			changes = append(changes, fmt.Sprintf("Interface added: %s", name))
+			continue
+		}
+
+		if len(oldIface.IPs) != len(newIface.IPs) || fmt.Sprintf("%v", oldIface.IPs) != fmt.Sprintf("%v", newIface.IPs) {
+			changes = append(changes, fmt.Sprintf("IP change on interface %s: %v -> %v", name, oldIface.IPs, newIface.IPs))
+		}
+	}
+
+	for name := range oldState {
+		if _, exists := newState[name]; !exists {
+			changes = append(changes, fmt.Sprintf("Interface removed: %s", name))
+		}
+	}
+
+	return changes
+}
+
+type InterfaceState struct {
+	IPs []string
+}
+
+func monitorInstalledUninstalledApplications() {
+	var (
+		advapi32                    = syscall.NewLazyDLL("advapi32.dll")
+		procRegNotifyChangeKeyValue = advapi32.NewProc("RegNotifyChangeKeyValue")
+	)
+
+	const (
+		KEY_NOTIFY                 = 0x0010
+		REG_NOTIFY_CHANGE_NAME     = 0x0001
+		REG_NOTIFY_CHANGE_LAST_SET = 0x0004
+	)
+
+	// // Placeholder for the upload function
+	// upload := func(appKey string, action string) {
+	// 	log.Info().Str("Application", appKey).Str("Action", action).Msg("Trigger detected. Uploading changes...")
+	// }
+
+	// Helper function to get installed applications
+	getStoreApplications := func(key registry.Key) (map[string]struct{}, error) {
+		apps := make(map[string]struct{})
+		subKeys, err := key.ReadSubKeyNames(-1)
+		if err != nil {
+			return nil, err
+		}
+		for _, subKeyName := range subKeys {
+			apps[subKeyName] = struct{}{}
+		}
+		return apps, nil
+	}
+
+	// Helper function to monitor a registry key
+	monitorRegistryKey := func(hKey windows.Handle) {
+		key := registry.Key(hKey)
+		defer key.Close()
+
+		oldSnapshot, err := getStoreApplications(key)
+		if err != nil {
+			log.Error().Err(err).Msg("Error taking initial snapshot")
+			return
+		}
+
+		for {
+			// Wait for registry changes
+			status, _, err := procRegNotifyChangeKeyValue.Call(
+				uintptr(hKey),
+				1, // bWatchSubtree
+				REG_NOTIFY_CHANGE_NAME|REG_NOTIFY_CHANGE_LAST_SET,
+				0,
+				0,
+			)
+			if status != 0 {
+				log.Error().Err(err).Msg("Error waiting for registry change")
+				return
+			}
+
+			newSnapshot, err := getStoreApplications(key)
+			if err != nil {
+				log.Error().Err(err).Msg("Error taking new snapshot")
+				return
+			}
+
+			// Compare snapshots to detect changes
+			for appKey := range newSnapshot {
+				if _, found := oldSnapshot[appKey]; !found {
+					log.Info().Str("Application", appKey).Msg("Application Installed")
+					if err := getAndCompressAndUploadAllInstalledApplications(); err != nil {
+						log.Error().Err(err).Msg("Failed to compress and upload all installed applications.")
+					}
+
+				}
+			}
+
+			for appKey := range oldSnapshot {
+				if _, found := newSnapshot[appKey]; !found {
+					log.Info().Str("Application", appKey).Msg("Application Uninstalled")
+					if err := getAndCompressAndUploadAllInstalledApplications(); err != nil {
+						log.Error().Err(err).Msg("Failed to compress and upload all installed applications.")
+					}
+				}
+			}
+
+			oldSnapshot = newSnapshot
+		}
+	}
+
+	// Open registry keys and start monitoring
+	keys := []struct {
+		baseKey registry.Key
+		path    string
+	}{
+		{registry.CURRENT_USER, `Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages`},
+		{registry.LOCAL_MACHINE, `Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages`},
+	}
+
+	for _, keyInfo := range keys {
+		key, err := registry.OpenKey(keyInfo.baseKey, keyInfo.path, registry.READ|KEY_NOTIFY)
+		if err != nil {
+			log.Error().Err(err).Msg("Error opening registry key")
+			continue
+		}
+		hKey := windows.Handle(key)
+		go monitorRegistryKey(hKey)
+	}
+}
+
+func monitorAndDetectChangesForLocalUsers() {
+	var (
+		modNetapi32          = windows.NewLazySystemDLL("netapi32.dll")
+		procNetUserEnum      = modNetapi32.NewProc("NetUserEnum")
+		procNetApiBufferFree = modNetapi32.NewProc("NetApiBufferFree")
+	)
+
+	const (
+		MAX_PREFERRED_LENGTH  = 0xFFFFFFFF
+		FILTER_NORMAL_ACCOUNT = 2
+	)
+
+	type USER_INFO_1 struct {
+		Name        *uint16
+		Password    *uint16
+		PasswordAge uint32
+		Privilege   uint32
+		HomeDir     *uint16
+		Comment     *uint16
+		Flags       uint32
+		ScriptPath  *uint16
+	}
+
+	// Helper to fetch users
+	fetchLocalUsers := func() (map[string]map[string]string, error) {
+		var entriesRead, totalEntries, resumeHandle uint32
+		var buf unsafe.Pointer
+
+		ret, _, _ := procNetUserEnum.Call(
+			0, // servername (null for local machine)
+			1, // level (USER_INFO_1)
+			uintptr(FILTER_NORMAL_ACCOUNT),
+			uintptr(unsafe.Pointer(&buf)),
+			MAX_PREFERRED_LENGTH,
+			uintptr(unsafe.Pointer(&entriesRead)),
+			uintptr(unsafe.Pointer(&totalEntries)),
+			uintptr(unsafe.Pointer(&resumeHandle)),
+		)
+		if ret != 0 {
+			return nil, fmt.Errorf("NetUserEnum call failed with code %d", ret)
+		}
+		defer procNetApiBufferFree.Call(uintptr(buf))
+
+		users := make(map[string]map[string]string)
+		userInfo := (*[1 << 30]USER_INFO_1)(buf)[:entriesRead:entriesRead]
+
+		for _, user := range userInfo {
+			username := syscall.UTF16ToString((*[1 << 30]uint16)(unsafe.Pointer(user.Name))[:])
+			userData := map[string]string{
+				"Name":        username,
+				"Flags":       fmt.Sprintf("%d", user.Flags),
+				"PasswordAge": fmt.Sprintf("%d", user.PasswordAge), // Include PasswordAge
+			}
+			users[username] = userData
+		}
+
+		return users, nil
+	}
+
+	// Helper to detect changes
+	detectChanges := func(oldState, newState map[string]map[string]string) {
+		changeDetected := false
+
+		// Detect added users
+		for username := range newState {
+			if _, exists := oldState[username]; !exists {
+				log.Info().Str("username", username).Msg("User added")
+				changeDetected = true
+			}
+		}
+
+		// Detect removed users
+		for username := range oldState {
+			if _, exists := newState[username]; !exists {
+				log.Info().Str("username", username).Msg("User removed")
+				changeDetected = true
+			}
+		}
+
+		// Helper to convert string to integer
+		atoi := func(s string) int {
+			val, err := strconv.Atoi(s)
+			if err != nil {
+				return 0
+			}
+			return val
+		}
+
+		// Detect modified users and password changes
+		for username, newUserData := range newState {
+			if oldUserData, exists := oldState[username]; exists {
+				for key, newValue := range newUserData {
+					if key == "PasswordAge" {
+						oldPasswordAge := atoi(oldUserData[key])
+						newPasswordAge := atoi(newValue)
+
+						if newPasswordAge < oldPasswordAge {
+							log.Info().Str("username", username).Msg("Password changed")
+							changeDetected = true
+						}
+						continue
+					}
+					if oldValue, exists := oldUserData[key]; exists && oldValue != newValue {
+						log.Info().
+							Str("username", username).
+							Str("field", key).
+							Str("old_value", oldValue).
+							Str("new_value", newValue).
+							Msg("User modified")
+						changeDetected = true
+					}
+				}
+			}
+		}
+
+		// If changes are detected, trigger the upload function
+		if changeDetected {
+			if err := getAndUploadLocalUsersAndGroups(); err != nil {
+				log.Error().Err(err).Msg("Failed to upload local users and groups.")
+			}
+		}
+	}
+
+	// Initial snapshot
+	oldState, err := fetchLocalUsers()
+	if err != nil {
+		log.Error().Err(err).Msg("Error fetching initial user state")
+		return
+	}
+	log.Info().Msg("Initial user state captured.")
+
+	// Polling loop
+	time.Sleep(1 * time.Minute) // Wait for 1 minute before starting the monitoring to make sure that the /real_time api was called and the configuration was set for the agent
+	for {
+		if activeDirectoryDomainController {
+			log.Info().Msg("Active Directory Domain Controller detected. Skipping user monitoring.")
+			return
+		}
+
+		time.Sleep(10 * time.Second) // Adjust polling interval as needed
+
+		newState, err := fetchLocalUsers()
+		if err != nil {
+			log.Error().Err(err).Msg("Error fetching users")
+			continue
+		}
+
+		// Detect changes
+		detectChanges(oldState, newState)
+
+		// Update the old state to the new state
+		oldState = newState
+	}
+}
+
+func watchDNSFile() {
+	dnsFilePath := `C:\Windows\System32\drivers\etc\hosts`
+	var previousHash string
+
+	for {
+		// Wait for 20 seconds before checking again
+		time.Sleep(20 * time.Second)
+
+		fileData, err := os.ReadFile(dnsFilePath)
+		if err != nil {
+			log.Error().Err(err).Msgf("Failed to read file %s", dnsFilePath)
+			continue
+		}
+
+		currentHash, err := getHexHash(string(fileData))
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to get hash of DNS file.")
+			continue
+		}
+
+		if currentHash == previousHash {
+			log.Debug().Msg("DNS file has not changed. Skipping upload.")
+			continue
+		}
+
+		if currentHash != previousHash {
+			log.Info().Msg("DNS file has changed. Uploading DNS data...")
+			if err := getAndCompressAndUploadLocalDNS(); err != nil {
+				log.Error().Err(err).Msg("Failed to compress and upload local DNS.")
+			}
+			previousHash = currentHash
+		}
+	}
 }
 
 // startPeriodicUploadLogs initializes the process of uploading logs to the server.
@@ -5013,12 +5403,16 @@ func uploadWindowsUsersInformationV2() error {
 	}
 
 	if !activeDirectoryDomainController {
-		if err := getAndUploadLocalUsersV2(); err != nil {
-			return fmt.Errorf("failed to get and upload local users: %w", err)
-		}
+		// if err := getAndUploadLocalUsersV2(); err != nil {
+		// 	return fmt.Errorf("failed to get and upload local users: %w", err)
+		// }
 
-		if err := getAndUploadLocalGroups(); err != nil {
-			return fmt.Errorf("failed to upload local groups: %w", err)
+		// if err := getAndUploadLocalGroups(); err != nil {
+		// 	return fmt.Errorf("failed to upload local groups: %w", err)
+		// }
+
+		if err := getAndUploadLocalUsersAndGroups(); err != nil {
+			return fmt.Errorf("failed to upload local users and groups: %w", err)
 		}
 
 		log.Info().Msg("Successfully uploaded local users' and groups' information.")
@@ -5035,6 +5429,20 @@ func uploadWindowsUsersInformationV2() error {
 	}
 
 	log.Info().Msg("Successfully uploaded domain users' and groups' information.")
+
+	return nil
+}
+
+func getAndUploadLocalUsersAndGroups() error {
+	log.Info().Msg("Starting the process of uploading local users and groups...")
+
+	if err := getAndUploadLocalUsersV2(); err != nil {
+		return fmt.Errorf("failed to get and upload local users: %w", err)
+	}
+
+	if err := getAndUploadLocalGroups(); err != nil {
+		return fmt.Errorf("failed to upload local groups: %w", err)
+	}
 
 	return nil
 }
@@ -5638,6 +6046,9 @@ func fetchAndExecutePatchesScript() error {
 	}
 
 	filePath := filepath.Join(CymetricxPath, "getpatches.ps1")
+
+	copyFile(filePath, "getpatches.ps1")
+
 	if err := runPS1FileWithoutOutput(filePath); err != nil {
 		return err
 	}

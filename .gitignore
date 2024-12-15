@@ -9,6 +9,15 @@
 
 # Ignore specific Go files
 main2.go
+main4.go
+main5.go
+main6.go
+main7.go
+main8.go
+main9.go
+main10.go
+main11.go
+main12.go
 *_test.go
 test_registry.go
 
