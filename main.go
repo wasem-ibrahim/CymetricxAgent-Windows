@@ -38,6 +38,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf16"
@@ -57,6 +58,7 @@ import (
 	"github.com/shirou/gopsutil/disk"
 	"github.com/shirou/gopsutil/process"
 	"github.com/shirou/gopsutil/v3/mem"
+
 	"github.com/yusufpapurcu/wmi"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -520,10 +522,10 @@ func setupLoggerSettings() {
 
 	ljhook := logRotaterConfigs()
 	// Output to console and log file
-	//output := zerolog.MultiLevelWriter(ljhook, zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC1123})
+	output := zerolog.MultiLevelWriter(ljhook, zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC1123})
 
 	// Output to log file only
-	output := zerolog.MultiLevelWriter(ljhook)
+	// output := zerolog.MultiLevelWriter(ljhook)
 
 	// Output to console only
 	//_ = ljhook
@@ -1912,11 +1914,15 @@ func holdingAgentForever() {
 func startGoRoutines(iniData ini.IniConfig, serialNumber string, cmdFlags CMDFlags) {
 	log.Info().Msg("Starting the go routines...")
 
-	// This is responsible for running and dealing with the "Cymetricx Recovery" service that runs next to "Cyemtricx agent"
-	if err := handleCymetricxRecoveryServiceStatus(cmdFlags); err != nil {
-		// We don't to break out of the for loop if the cymetricx recovery failed to run because we care more about the
-		// cymetricx agent itself to be running But we would still want to log it in the logs to check why that happened
-		log.Warn().Err(err).Msg("Failed to handle cymetricx recovery service status.")
+	// // This is responsible for running and dealing with the "Cymetricx Recovery" service that runs next to "Cyemtricx agent"
+	// if err := handleCymetricxRecoveryServiceStatus(cmdFlags); err != nil {
+	// 	// We don't to break out of the for loop if the cymetricx recovery failed to run because we care more about the
+	// 	// cymetricx agent itself to be running But we would still want to log it in the logs to check why that happened
+	// 	log.Warn().Err(err).Msg("Failed to handle cymetricx recovery service status.")
+	// }
+
+	if err := callRealTimeAndProcessFeatureSettings(serialNumber); err != nil {
+		log.Error().Err(err).Msg("Failed to call real time and process feature settings before starting go routines.")
 	}
 
 	// Call this first because it pulls configuration values for other functions.
@@ -1930,22 +1936,167 @@ func startGoRoutines(iniData ini.IniConfig, serialNumber string, cmdFlags CMDFla
 	go startInitialFullSystemDataAndDetailsScan()
 	go startPeriodicUploadLogs()
 	go checkingUSNPeriodecly()
+
 	go watchDNSFile()
 	go monitorAndDetectChangesForLocalUsers()
 	go monitorInstalledUninstalledApplications()
 	go monitorNetworkInterfaces()
+	go monitorServiceChanges()
 
 	log.Info().Msg("Successfully started the go routines.")
 }
 
-func monitorNetworkInterfaces() {
-	// Place holder function:
-	upload2 := func(changes []string) {
-		fmt.Println("Changes detected:")
-		for _, change := range changes {
-			fmt.Println(" -", change)
+type serviceInfo struct {
+	name string
+}
+
+// Query all services currently available in the Service Control Manager
+func queryServices() ([]serviceInfo, error) {
+
+	var services []serviceInfo
+
+	// Open the Service Control Manager
+	scmHandle, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_ENUMERATE_SERVICE)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open service manager: %w", err)
+	}
+	defer windows.CloseServiceHandle(scmHandle)
+
+	// Query all services
+	var bytesNeeded, servicesReturned, resumeHandle uint32
+	for {
+		var buffer [1 << 14]byte // 16KB buffer
+		err := windows.EnumServicesStatusEx(
+			scmHandle,
+			windows.SC_ENUM_PROCESS_INFO,
+			windows.SERVICE_WIN32,
+			windows.SERVICE_STATE_ALL,
+			&buffer[0],
+			uint32(len(buffer)),
+			&bytesNeeded,
+			&servicesReturned,
+			&resumeHandle,
+			nil,
+		)
+		if err != nil && err != windows.ERROR_MORE_DATA {
+			return nil, fmt.Errorf("failed to enumerate services: %w", err)
+		}
+
+		serviceArray := (*[1 << 20]windows.ENUM_SERVICE_STATUS_PROCESS)(unsafe.Pointer(&buffer[0]))[:servicesReturned:servicesReturned]
+		for _, service := range serviceArray {
+			serviceName := windows.UTF16ToString((*[256]uint16)(unsafe.Pointer(service.ServiceName))[:])
+			services = append(services, serviceInfo{name: serviceName})
+		}
+
+		if err != windows.ERROR_MORE_DATA {
+			break
 		}
 	}
+
+	return services, nil
+}
+
+// Monitor services for additions or removals
+func monitorServiceChanges() {
+	// trigger := func(event, name string) {
+	// 	log.Info().Str("Event", event).Str("Service", name).Msg("Service event detected")
+	// }
+
+	lastServiceSet := make(map[string]struct{})
+
+	// Initial service query
+	services, err := queryServices()
+	if err != nil {
+		log.Fatal().Err(err).Msg("Error querying services")
+	}
+
+	for _, service := range services {
+		lastServiceSet[service.name] = struct{}{}
+	}
+
+	log.Info().Msg("Monitoring for added or removed services...")
+
+	for {
+		currentServiceSet := make(map[string]struct{})
+
+		// Query the services again
+		services, err := queryServices()
+		if err != nil {
+			log.Error().Err(err).Msg("Error querying services")
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		for _, service := range services {
+			currentServiceSet[service.name] = struct{}{}
+		}
+
+		// Detect added services
+		for name := range currentServiceSet {
+			if _, exists := lastServiceSet[name]; !exists {
+				log.Info().Str("Service", name).Msg("Service added")
+				if err := getAndCompressAndUploadAllWindowsServices(); err != nil {
+					log.Error().Err(err).Msg("Failed to compress and upload windows services.")
+				}
+			}
+		}
+
+		// Detect removed services
+		for name := range lastServiceSet {
+			if _, exists := currentServiceSet[name]; !exists {
+				log.Info().Str("Service", name).Msg("Service removed")
+				if err := getAndCompressAndUploadAllWindowsServices(); err != nil {
+					log.Error().Err(err).Msg("Failed to compress and upload windows services.")
+				}
+			}
+		}
+
+		// Update the last known state
+		lastServiceSet = currentServiceSet
+
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func getAndSendNetworkInterfaces() error {
+	log.Info().Msg("Starting the process of uploading Network Interfaces...")
+
+	// Get the local DNS mappings.
+	networkInterfaces, err := getNetworkInterfaceInfo()
+	if err != nil {
+		return fmt.Errorf("failed to get network interfaces: %w", err)
+	}
+
+	networkInterfacesMap := map[string]interface{}{
+		"network": networkInterfaces,
+	}
+
+	jsonPayload, err := json.Marshal(networkInterfacesMap)
+	if err != nil {
+		return fmt.Errorf("failed to marshal network interfaces: %w", err)
+	}
+
+	responseBody, err := prepareAndExecuteHTTPRequestWithTokenValidityForWindowsV2("POST", "upload-network-data/"+id, jsonPayload, 10)
+	if err != nil {
+		log.Error().Err(err).Msg("Error while uploading Network Interfaces.")
+	}
+
+	if err := readGeneralReponseBody(responseBody); err != nil {
+		return fmt.Errorf("failed to upload network interfaces: %w", err)
+	}
+
+	// Check if the response body contains the string "success".
+	if err := readGeneralReponseBody(responseBody); err != nil {
+		return fmt.Errorf("failed to upload network interfaces: %w", err)
+	}
+
+	log.Info().Msg("Successfully uploaded Network Interfaces.")
+
+	return nil
+}
+
+func monitorNetworkInterfaces() {
+	log.Info().Msg("Starting the process of monitoring network interfaces...")
 
 	previousState, err := getInterfacesState()
 	if err != nil {
@@ -1962,11 +2113,13 @@ func monitorNetworkInterfaces() {
 
 		changes := compareStates(previousState, currentState)
 		if len(changes) > 0 {
-			upload2(changes)
+			if err := getAndSendNetworkInterfaces(); err != nil {
+				log.Error().Err(err).Msg("Failed to upload network interfaces.")
+			}
 		}
 
 		previousState = currentState
-		time.Sleep(2 * time.Second) // Poll every 2 seconds
+		time.Sleep(20 * time.Second) // Poll every 2 seconds
 	}
 }
 
@@ -2011,8 +2164,16 @@ func compareStates(oldState, newState map[string]InterfaceState) []string {
 			continue
 		}
 
-		if len(oldIface.IPs) != len(newIface.IPs) || fmt.Sprintf("%v", oldIface.IPs) != fmt.Sprintf("%v", newIface.IPs) {
-			changes = append(changes, fmt.Sprintf("IP change on interface %s: %v -> %v", name, oldIface.IPs, newIface.IPs))
+		oldIPs := make(map[string]bool)
+		for _, ip := range oldIface.IPs {
+			oldIPs[ip] = true
+		}
+
+		for _, ip := range newIface.IPs {
+			if !oldIPs[ip] {
+				changes = append(changes, fmt.Sprintf("IP change on interface %s: %v -> %v", name, oldIface.IPs, newIface.IPs))
+				break
+			}
 		}
 	}
 
@@ -2029,7 +2190,142 @@ type InterfaceState struct {
 	IPs []string
 }
 
+// func monitorInstalledUninstalledApplications() {
+// 	log.Info().Msg("Starting the process of monitoring installed and uninstalled applications...")
+
+// 	var (
+// 		advapi32                    = syscall.NewLazyDLL("advapi32.dll")
+// 		procRegNotifyChangeKeyValue = advapi32.NewProc("RegNotifyChangeKeyValue")
+// 	)
+
+// 	const (
+// 		KEY_NOTIFY                 = 0x0010
+// 		REG_NOTIFY_CHANGE_NAME     = 0x0001
+// 		REG_NOTIFY_CHANGE_LAST_SET = 0x0004
+// 	)
+
+// 	// // Placeholder for the upload function
+// 	// upload := func(appKey string, action string) {
+// 	// 	log.Info().Str("Application", appKey).Str("Action", action).Msg("Trigger detected. Uploading changes...")
+// 	// }
+
+// 	// Helper function to get installed applications
+// 	getStoreApplications := func(key registry.Key) (map[string]struct{}, error) {
+// 		apps := make(map[string]struct{})
+// 		subKeys, err := key.ReadSubKeyNames(-1)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 		for _, subKeyName := range subKeys {
+// 			apps[subKeyName] = struct{}{}
+// 		}
+// 		return apps, nil
+// 	}
+
+// 	// Helper function to monitor a registry key
+// 	monitorRegistryKey := func(hKey windows.Handle) {
+// 		key := registry.Key(hKey)
+// 		defer key.Close()
+
+// 		oldSnapshot, err := getStoreApplications(key)
+// 		if err != nil {
+// 			log.Error().Err(err).Msg("Error taking initial snapshot")
+// 			return
+// 		}
+
+// 		for {
+// 			// Wait for registry changes
+// 			status, _, err := procRegNotifyChangeKeyValue.Call(
+// 				uintptr(hKey),
+// 				1, // bWatchSubtree
+// 				REG_NOTIFY_CHANGE_NAME|REG_NOTIFY_CHANGE_LAST_SET,
+// 				0,
+// 				0,
+// 			)
+// 			if status != 0 {
+// 				log.Error().Err(err).Msg("Error waiting for registry change")
+// 				return
+// 			}
+
+// 			newSnapshot, err := getStoreApplications(key)
+// 			if err != nil {
+// 				log.Error().Err(err).Msg("Error taking new snapshot")
+// 				return
+// 			}
+
+// 			// Compare snapshots to detect changes
+// 			for appKey := range newSnapshot {
+// 				if _, found := oldSnapshot[appKey]; !found {
+// 					log.Info().Msgf("Application Installed: %s", appKey)
+// 					if err := getAndCompressAndUploadAllInstalledApplications(); err != nil {
+// 						log.Error().Err(err).Msg("Failed to compress and upload all installed applications.")
+// 					}
+
+// 				}
+// 			}
+
+// 			for appKey := range oldSnapshot {
+// 				if _, found := newSnapshot[appKey]; !found {
+// 					log.Info().Msgf("Application Uninstalled: %s", appKey)
+// 					if err := getAndCompressAndUploadAllInstalledApplications(); err != nil {
+// 						log.Error().Err(err).Msg("Failed to compress and upload all installed applications.")
+// 					}
+// 				}
+// 			}
+
+// 			oldSnapshot = newSnapshot
+// 		}
+// 	}
+
+// 	// Get the user ID for current user
+// 	userID, err := getWindowsUserIDV2()
+// 	if err != nil {
+// 		log.Error().Err(err).Msg("Error getting user ID")
+// 		return
+// 	}
+
+// 	// Add all registry paths from getInstalledApplicationsForAllAndCurrentUserV2 and include user-specific keys
+// 	keys := []struct {
+// 		baseKey registry.Key
+// 		path    string
+// 	}{
+// 		// Existing keys
+// 		{registry.CURRENT_USER, `Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages`},
+// 		{registry.LOCAL_MACHINE, `Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages`},
+
+// 		// Additional keys based on getInstalledApplicationsForAllAndCurrentUserV2
+// 		{registry.LOCAL_MACHINE, `SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall`},
+// 		{registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`},
+// 		{registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Uninstall`},
+// 		{registry.CURRENT_USER, `Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall`},
+
+// 		// User-specific registry paths using userID
+// 		{registry.USERS, fmt.Sprintf(`%s\Software\Microsoft\Windows\CurrentVersion\Uninstall`, userID)},
+// 		{registry.USERS, fmt.Sprintf(`%s\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall`, userID)},
+// 	}
+
+// 	// Monitor all registry keys
+// 	for _, keyInfo := range keys {
+// 		key, err := registry.OpenKey(keyInfo.baseKey, keyInfo.path, registry.READ|KEY_NOTIFY)
+// 		if err != nil {
+// 			log.Error().Err(err).Msg("Error opening registry key")
+// 			continue
+// 		}
+// 		hKey := windows.Handle(key)
+// 		go monitorRegistryKey(hKey)
+// 	}
+// }
+
+var seenApplications = struct {
+	sync.Mutex
+	data map[string]time.Time
+}{
+	data: make(map[string]time.Time),
+}
+
 func monitorInstalledUninstalledApplications() {
+	log.Info().Msg("Starting the process of monitoring installed and uninstalled applications...")
+
 	var (
 		advapi32                    = syscall.NewLazyDLL("advapi32.dll")
 		procRegNotifyChangeKeyValue = advapi32.NewProc("RegNotifyChangeKeyValue")
@@ -2040,11 +2336,6 @@ func monitorInstalledUninstalledApplications() {
 		REG_NOTIFY_CHANGE_NAME     = 0x0001
 		REG_NOTIFY_CHANGE_LAST_SET = 0x0004
 	)
-
-	// // Placeholder for the upload function
-	// upload := func(appKey string, action string) {
-	// 	log.Info().Str("Application", appKey).Str("Action", action).Msg("Trigger detected. Uploading changes...")
-	// }
 
 	// Helper function to get installed applications
 	getStoreApplications := func(key registry.Key) (map[string]struct{}, error) {
@@ -2093,17 +2384,28 @@ func monitorInstalledUninstalledApplications() {
 			// Compare snapshots to detect changes
 			for appKey := range newSnapshot {
 				if _, found := oldSnapshot[appKey]; !found {
-					log.Info().Str("Application", appKey).Msg("Application Installed")
+					if isRecentlySeen(appKey) {
+						continue // Skip if the app was recently processed
+					}
+
+					log.Info().Msgf("Application Installed: %s", appKey)
+					markAsSeen(appKey)
+
 					if err := getAndCompressAndUploadAllInstalledApplications(); err != nil {
 						log.Error().Err(err).Msg("Failed to compress and upload all installed applications.")
 					}
-
 				}
 			}
 
 			for appKey := range oldSnapshot {
 				if _, found := newSnapshot[appKey]; !found {
-					log.Info().Str("Application", appKey).Msg("Application Uninstalled")
+					if isRecentlySeen(appKey) {
+						continue // Skip if the app was recently processed
+					}
+
+					log.Info().Msgf("Application Uninstalled: %s", appKey)
+					markAsSeen(appKey)
+
 					if err := getAndCompressAndUploadAllInstalledApplications(); err != nil {
 						log.Error().Err(err).Msg("Failed to compress and upload all installed applications.")
 					}
@@ -2114,15 +2416,31 @@ func monitorInstalledUninstalledApplications() {
 		}
 	}
 
-	// Open registry keys and start monitoring
+	// Get the user ID for the current user
+	userID, err := getWindowsUserIDV2()
+	if err != nil {
+		log.Error().Err(err).Msg("Error getting user ID")
+		return
+	}
+
+	// Registry keys to monitor
 	keys := []struct {
 		baseKey registry.Key
 		path    string
 	}{
-		{registry.CURRENT_USER, `Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages`},
-		{registry.LOCAL_MACHINE, `Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages`},
+		// For microsft store applications
+		// {registry.CURRENT_USER, `Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages`},
+		// {registry.LOCAL_MACHINE, `Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages`},
+
+		{registry.LOCAL_MACHINE, `SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall`},
+		{registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`},
+		{registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Uninstall`},
+		{registry.CURRENT_USER, `Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall`},
+		{registry.USERS, fmt.Sprintf(`%s\Software\Microsoft\Windows\CurrentVersion\Uninstall`, userID)},
+		{registry.USERS, fmt.Sprintf(`%s\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall`, userID)},
 	}
 
+	// Monitor all registry keys
 	for _, keyInfo := range keys {
 		key, err := registry.OpenKey(keyInfo.baseKey, keyInfo.path, registry.READ|KEY_NOTIFY)
 		if err != nil {
@@ -2132,9 +2450,55 @@ func monitorInstalledUninstalledApplications() {
 		hKey := windows.Handle(key)
 		go monitorRegistryKey(hKey)
 	}
+
+	// Start periodic cleanup of the seenApplications map
+	go cleanupSeenApplications()
+}
+
+func markAsSeen(appKey string) {
+	seenApplications.Lock()
+	defer seenApplications.Unlock()
+	seenApplications.data[appKey] = time.Now()
+}
+
+func isRecentlySeen(appKey string) bool {
+	seenApplications.Lock()
+	defer seenApplications.Unlock()
+
+	if lastSeen, found := seenApplications.data[appKey]; found {
+		if time.Since(lastSeen) < 5*time.Second {
+			return true // Recently seen
+		}
+	}
+	return false
+}
+
+func init() {
+	go cleanupSeenApplications()
+}
+
+func cleanupSeenApplications() {
+	for {
+		time.Sleep(1 * time.Minute)
+		seenApplications.Lock()
+		now := time.Now()
+		for appKey, timestamp := range seenApplications.data {
+			if now.Sub(timestamp) > 1*time.Minute {
+				delete(seenApplications.data, appKey)
+			}
+		}
+		seenApplications.Unlock()
+	}
 }
 
 func monitorAndDetectChangesForLocalUsers() {
+	log.Info().Msg("Starting the process of monitoring and detecting changes for local users...")
+
+	if activeDirectoryDomainController {
+		log.Info().Msg("Active Directory Domain Controller detected. Skipping user monitoring.")
+		return
+	}
+
 	var (
 		modNetapi32          = windows.NewLazySystemDLL("netapi32.dll")
 		procNetUserEnum      = modNetapi32.NewProc("NetUserEnum")
@@ -2268,10 +2632,6 @@ func monitorAndDetectChangesForLocalUsers() {
 	// Polling loop
 	time.Sleep(1 * time.Minute) // Wait for 1 minute before starting the monitoring to make sure that the /real_time api was called and the configuration was set for the agent
 	for {
-		if activeDirectoryDomainController {
-			log.Info().Msg("Active Directory Domain Controller detected. Skipping user monitoring.")
-			return
-		}
 
 		time.Sleep(10 * time.Second) // Adjust polling interval as needed
 
@@ -2310,7 +2670,6 @@ func watchDNSFile() {
 		}
 
 		if currentHash == previousHash {
-			log.Debug().Msg("DNS file has not changed. Skipping upload.")
 			continue
 		}
 
@@ -4053,7 +4412,7 @@ func createAndExecuteUploadRequestV2(endPoint string, filePath string) (bytes.Bu
 }
 
 // createAndExecuteUploadRequest creates a file upload request and executes it using the HTTP client.
-func createAndExecuteUploadRequestV3(endPoint string, filePath string) (bytes.Buffer, error) {
+func createAndExecuteFileUploadRequest(endPoint string, filePath string) (bytes.Buffer, error) {
 	log.Info().Str("EndPoint", endPoint).Str("FilePath", filePath).Msg("Starting file upload request...")
 
 	if !fileExists(filePath) {
@@ -4908,17 +5267,59 @@ func getAndCompressAndUploadAllInstalledApplications() error {
 		return err
 	}
 
-	responseBody, err := createAndExecuteUploadRequestV3("upload_realtime/"+id+"/windows/installed_applications", filePath)
+	responseBody, err := createAndExecuteFileUploadRequest("upload_realtime/"+id+"/windows/application_realtime", filePath)
 	if err != nil {
 		return err
 	}
 
 	// Check if the response body contains the string "success".
 	if err := readGeneralReponseBody(responseBody); err != nil {
-		return fmt.Errorf("failed to upload local DNS mappings to upload real time: %w", err)
+		return fmt.Errorf("failed to upload installed applications to upload real time: %w", err)
 	}
 
 	log.Info().Msg("Successfully compressed and uploaded installed applications.")
+
+	return nil
+}
+
+func getAndCompressAndUploadAllWindowsServices() error {
+	log.Info().Msg("Starting the process of compressing and uploading all Windows services...")
+
+	// Get the local DNS mappings.
+	windowsServicesStatusJson, err := getAllWindowsServicesStatus()
+	if err != nil {
+		return err
+	}
+
+	type windowsServices struct {
+		Get_GetService string `json:"get_GetService"`
+	}
+
+	windowsServicesStruct := windowsServices{
+		Get_GetService: windowsServicesStatusJson,
+	}
+
+	jsonPayload, err := json.Marshal(windowsServicesStruct)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Windows services payload: %w", err)
+	}
+
+	filePath, err := createAndCompressPayloadIntoGZipFile(jsonPayload, "windows-services.gz")
+	if err != nil {
+		return err
+	}
+
+	responseBody, err := createAndExecuteFileUploadRequest("upload_realtime/"+id+"/windows/services_realtime", filePath)
+	if err != nil {
+		return err
+	}
+
+	// Check if the response body contains the string "success".
+	if err := readGeneralReponseBody(responseBody); err != nil {
+		return fmt.Errorf("failed to upload Windows services to upload real time: %w", err)
+	}
+
+	log.Info().Msg("Successfully compressed and uploaded Windows services.")
 
 	return nil
 }
@@ -4950,7 +5351,7 @@ func getAndCompressAndUploadLocalDNS() error {
 		return err
 	}
 
-	responseBody, err := createAndExecuteUploadRequestV3("upload_realtime/"+id+"/windows/local_dns", filePath)
+	responseBody, err := createAndExecuteFileUploadRequest("upload_realtime/"+id+"/windows/local_dns", filePath)
 	if err != nil {
 		return err
 	}
@@ -5044,6 +5445,11 @@ func getInstalledApplicationsForAllAndCurrentUserV2(userID string) (string, erro
 		{registry.LOCAL_MACHINE, "HKEY_LOCAL_MACHINE", `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`},
 		{registry.CURRENT_USER, "HKEY_CURRENT_USER", `Software\Microsoft\Windows\CurrentVersion\Uninstall`},
 		{registry.CURRENT_USER, "HKEY_CURRENT_USER", `Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall`},
+
+		// New for microsoft store apps
+		// {registry.CURRENT_USER, "HKEY_CURRENT_USER", `Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages`},
+		// {registry.LOCAL_MACHINE, "HKEY_LOCAL_MACHINE", `Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages`},
+
 		// Add user-specific paths using the provided SID
 		{registry.USERS, "HKEY_USERS", fmt.Sprintf(`%s\Software\Microsoft\Windows\CurrentVersion\Uninstall`, userID)},
 		{registry.USERS, "HKEY_USERS", fmt.Sprintf(`%s\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall`, userID)},
@@ -5109,6 +5515,8 @@ func getInstalledApplicationsForAllAndCurrentUserV2(userID string) (string, erro
 	if err != nil {
 		return "", err
 	}
+
+	fmt.Println(string(jsonOutput))
 
 	return string(jsonOutput), nil
 
@@ -5238,6 +5646,7 @@ func createNonExcutableFile(nonExcutableFileName string, nonExcutableFileContent
 // runPS1FileWithOutput executes the ps1 file and returns the output of the excution
 func runPS1FileWithOutput(ps1FileName string) ([]byte, error) {
 	defer os.Remove(ps1FileName)
+
 	psScript := []string{"-NoProfile", "-NonInteractive", "-NoLogo", powerShellPath, "-ExecutionPolicy", "unrestricted", "-File", fmt.Sprintf(`"%s"`, ps1FileName)}
 	output, err := execCommandWithOutputRaw(powerShellPath, psScript...)
 	if err != nil {
@@ -5247,28 +5656,48 @@ func runPS1FileWithOutput(ps1FileName string) ([]byte, error) {
 	return output, nil
 }
 
-// runPS1FileWithOutputForexeccommand executes the ps1 file and returns the output of the excution
+// runPS1FileWithOutputForexeccommand executes the ps1 file and returns the output of the execution, with stderr included in errors
 func runPS1FileWithOutputForexeccommand(ps1FileName string) ([]byte, error) {
 	defer os.Remove(ps1FileName)
-	psScript := []string{"-NoProfile", "-NonInteractive", "-NoLogo", powerShellPath, "-ExecutionPolicy", "unrestricted", "-File", ps1FileName}
+
+	psScript := []string{"-NoProfile", "-NonInteractive", "-NoLogo", powerShellPath, "-ExecutionPolicy", "unrestricted", "-File", fmt.Sprintf(`"%s"`, ps1FileName)}
 	cmd := exec.Command(powerShellPath, psScript...)
+
 	// Capture the command's standard output and standard error
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("error stdout %s because of: %w", ps1FileName, err)
 	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("error stderr %s because of: %w", ps1FileName, err)
+	}
+
 	// Start the command
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("error Start %s because of: %w", ps1FileName, err)
 	}
 
 	// Read the standard output and standard error
-	stdoutBytes, _ := io.ReadAll(stdout)
+	stdoutBytes, err := io.ReadAll(stdout)
+	if err != nil {
+		return nil, fmt.Errorf("error reading stdout %s because of: %w", ps1FileName, err)
+	}
+	stderrBytes, err := io.ReadAll(stderr)
+	if err != nil {
+		return nil, fmt.Errorf("error reading stderr %s because of: %w", ps1FileName, err)
+	}
 
 	// Wait for the command to finish
 	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("error Wait %s because of: %w", ps1FileName, err)
+		return nil, fmt.Errorf("error Wait %s because of: %w\nstderr: %s", ps1FileName, err, string(stderrBytes))
 	}
+
+	// If there's any stderr content, include it in the error
+	if len(stderrBytes) > 0 {
+		return stdoutBytes, fmt.Errorf("stderr: %s", string(stderrBytes))
+	}
+
 	return stdoutBytes, nil
 }
 
@@ -5277,7 +5706,7 @@ func runPS1FileWithoutOutput(ps1FileName string) error {
 	defer os.Remove(ps1FileName)
 
 	psScript := []string{"-NoProfile", "-NonInteractive", "-NoLogo", powerShellPath, "-ExecutionPolicy", "unrestricted", "-File", fmt.Sprintf(`"%s"`, ps1FileName)}
-	// cmd := exec.Command(powerShellPath, psScript...)
+
 	if err := execCommandWithoutOutput(powerShellPath, psScript...); err != nil {
 		return err
 	}
@@ -5318,15 +5747,20 @@ func createAndRunPS1FileWithOutput(ps1FileName string, ps1Content string) ([]byt
 	return output, nil
 }
 
-// createAndRunPS1FileWithOutputForexeccommand creates the ps1 file with the given content and name and executes it and returns the output of the excution
-func createAndRunPS1FileWithOutputForexeccommand(ps1FileName string, ps1Content string) ([]byte, error) {
-	if err := createExcutableFile(ps1FileName, ps1Content); err != nil {
-		return nil, fmt.Errorf("error creating %s because of: %w", ps1FileName, err)
+// createAndRunPS1FileWithOutputForExecCommand creates the ps1 file with the given content and name and executes it and returns the output of the excution
+func createAndRunPS1FileWithOutputForExecCommand(ps1FileName string, ps1Content string) ([]byte, error) {
+	filePath := filepath.Join(CymetricxPath, ps1FileName)
+
+	// if err := createExcutableFile(ps1FileName, ps1Content); err != nil {
+	if err := createExcutableFile(filePath, ps1Content); err != nil {
+		return nil, fmt.Errorf("error creating %s because of: %w", filePath, err)
 	}
-	defer os.Remove(ps1FileName)
-	output, err := runPS1FileWithOutputForexeccommand(ps1FileName)
+	defer os.Remove(filePath)
+
+	// output, err := runPS1FileWithOutputForexeccommand(ps1FileName)
+	output, err := runPS1FileWithOutputForexeccommand(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("error executing %s because of: %w", ps1FileName, err)
+		return nil, fmt.Errorf("error executing %s because of: %w", filePath, err)
 	}
 
 	return output, nil
@@ -5354,7 +5788,7 @@ func getAndUploadLocalUsersV2() error {
 		return err
 	}
 
-	responseBody, err := createAndExecuteUploadRequestV3("upload_local_users_from_windows/"+id, filePath)
+	responseBody, err := createAndExecuteFileUploadRequest("upload_local_users_from_windows/"+id, filePath)
 	if err != nil {
 		return err
 	}
@@ -5473,7 +5907,7 @@ func uploadDomainUsersInformation() error {
 		return fmt.Errorf("failed to create zip file for local domain users: %w", err)
 	}
 
-	responseBody, err := createAndExecuteUploadRequestV3("upload_domain_users_from_windows/"+id, zipFilePath)
+	responseBody, err := createAndExecuteFileUploadRequest("upload_domain_users_from_windows/"+id, zipFilePath)
 	if err != nil {
 		return fmt.Errorf("failed to upload windows users information: %w", err)
 	}
@@ -5494,8 +5928,6 @@ func getAndUploadLocalGroups() error {
 	if err != nil {
 		return fmt.Errorf("failed to get local groups: %w", err)
 	}
-
-	log.Debug().Msgf("Local groups:\n%s", string(jsonPayload))
 
 	ifSame, err := checkIfHashFileSameOrUpdateIt("local-groups.txt", string(jsonPayload))
 	if err != nil {
@@ -6047,8 +6479,6 @@ func fetchAndExecutePatchesScript() error {
 
 	filePath := filepath.Join(CymetricxPath, "getpatches.ps1")
 
-	copyFile(filePath, "getpatches.ps1")
-
 	if err := runPS1FileWithoutOutput(filePath); err != nil {
 		return err
 	}
@@ -6085,7 +6515,7 @@ func processAndSendPatchResults() (err error) {
 	}
 
 	// Executing the upload request
-	responseBody, err := createAndExecuteUploadRequestV3("upload_patches/"+id, filePath)
+	responseBody, err := createAndExecuteFileUploadRequest("upload_patches/"+id, filePath)
 	if err != nil {
 		return err
 	}
@@ -6128,7 +6558,6 @@ type PatchesFileOutput struct {
 
 func readPatchesFileAndTurnItIntoJson() ([]byte, error) {
 	patchsconfsFile := filepath.Join(CymetricxPath, "patchsconfs.txt")
-	// defer os.Remove(patchsconfsFile)
 
 	// Read the file:
 	dataRaw, err := os.ReadFile(patchsconfsFile)
@@ -6290,7 +6719,7 @@ func collectCyscanDBDataAndCompressAndUploadItV2() error {
 	// minimalUploadInterval = 120
 	// maximalUploadInterval = 600
 
-	responseBody, err := createAndExecuteUploadRequestV3("upload_cyscan/"+id, filePath)
+	responseBody, err := createAndExecuteFileUploadRequest("upload_cyscan/"+id, filePath)
 	if err != nil {
 		return err
 	}
@@ -7071,7 +7500,7 @@ func compressAndUploadGPOsToServerV2() error {
 
 	// sleepForRandomDelayDuration(minimalUploadInterval, maximalUploadInterval)
 
-	responseBody, err := createAndExecuteUploadRequestV3("gpos/"+id, filePath)
+	responseBody, err := createAndExecuteFileUploadRequest("gpos/"+id, filePath)
 	if err != nil {
 		return fmt.Errorf("error in createAndExecuteUploadRequest: %w", err)
 	}
@@ -7097,7 +7526,7 @@ func compressAndUploadActiveDirectoryObjectsV2() error {
 
 	// sleepForRandomDelayDuration(minimalUploadInterval, maximalUploadInterval)
 
-	responseBody, err := createAndExecuteUploadRequestV3("compcs/"+id, filePath)
+	responseBody, err := createAndExecuteFileUploadRequest("compcs/"+id, filePath)
 	if err != nil {
 		return fmt.Errorf("error in createAndExecuteUploadRequest: %w", err)
 	}
@@ -7376,7 +7805,7 @@ func uploadProcessFromDBV2() error {
 
 	log.Info().Msg("FilePath for the process DB. About to start uploading...: " + filePath)
 
-	responseBody, err := createAndExecuteUploadRequestV3("windows_insert_process/"+id, filePath)
+	responseBody, err := createAndExecuteFileUploadRequest("windows_insert_process/"+id, filePath)
 	if err != nil {
 		return fmt.Errorf("error in windowsinsertprocess: %w", err)
 	}
@@ -7521,7 +7950,7 @@ func uploadServicesFromDB() error {
 
 	// sleepForRandomDelayDuration(minimalUploadInterval, maximalUploadInterval)
 
-	responseBody, err := createAndExecuteUploadRequestV3("windows_insert_services/"+id, filePath)
+	responseBody, err := createAndExecuteFileUploadRequest("windows_insert_services/"+id, filePath)
 	if err != nil {
 		return fmt.Errorf("error in windowsinsertservices: %w", err)
 	}
@@ -7742,7 +8171,7 @@ func uploadAllSystemDataAndDetailsAsBulkCSV() error {
 
 	// sleepForRandomDelayDuration(minimalUploadInterval, maximalUploadInterval)
 
-	responseBody, err := createAndExecuteUploadRequestV3("upload_group_of_data_csv/"+id, zipFilePath)
+	responseBody, err := createAndExecuteFileUploadRequest("upload_group_of_data_csv/"+id, zipFilePath)
 	if err != nil {
 		return fmt.Errorf("error in createAndExecuteUploadRequest: %w", err)
 	}
@@ -7800,7 +8229,7 @@ func uploadAllSystemDataAndDetailsAsBulk() error {
 
 	// sleepForRandomDelayDuration(minimalUploadInterval, maximalUploadInterval)
 
-	responseBody, err := createAndExecuteUploadRequestV3("upload_group_of_data/"+id, filePath)
+	responseBody, err := createAndExecuteFileUploadRequest("upload_group_of_data/"+id, filePath)
 	if err != nil {
 		return fmt.Errorf("error in uploading the grouped data: %w", err)
 	}
@@ -7855,7 +8284,7 @@ func createFeatureConfigs() []FeatureFunctionConfig {
 			ResultKey:    "get_localdns",
 		},
 		{
-			Func:         getAllServicesStatus,
+			Func:         getAllWindowsServicesStatus,
 			Toggle:       windowsservices,
 			HashFileName: "get_GetService.txt",
 			ResultKey:    "get_GetService",
@@ -8921,7 +9350,7 @@ func uploadAuditToprocess(command string, ifCallLaravel bool) error {
 	}
 
 	if ifCallLaravel {
-		responseBody, err := createAndExecuteUploadRequestV3("upload_benchmark_audit/"+id, gzipPath)
+		responseBody, err := createAndExecuteFileUploadRequest("upload_benchmark_audit/"+id, gzipPath)
 		if err != nil {
 			return fmt.Errorf("error in uploading benchmarking audit results to the server: %w", err)
 		}
@@ -9157,7 +9586,7 @@ func getWindowsDisplayVersion() (string, error) {
 	return value, nil
 }
 
-func getAllServicesStatus() (string, error) {
+func getAllWindowsServicesStatus() (string, error) {
 
 	script := `
 	# Retrieve information about services and format it
@@ -10007,6 +10436,63 @@ func createUpTimeJsonPayload(upTime string) ([]byte, error) {
 
 	return data, nil
 	// return passwordPolicyStruct, nil
+}
+
+func prepareAndExecuteHTTPRequestWithTokenValidityForWindowsV2(httpMethod, apiEndpoint string, jsonPayload []byte, retries int) (bytes.Buffer, error) {
+	// Create HTTP Request with Timeout
+	req, cancel, err := createHTTPRequestWithTimeoutForWindowsV2(httpMethod, apiEndpoint, jsonPayload)
+	if err != nil {
+		return bytes.Buffer{}, err
+	}
+	defer cancel()
+
+	// Execute HTTP Request
+	responseBody, err := executeHTTPRequestWithTokenValidtyV2(req, retries)
+	if err != nil {
+		return bytes.Buffer{}, fmt.Errorf("error sending %s request to %s: %w", req.Method, req.URL.Path, err)
+	}
+
+	return responseBody, nil
+}
+
+// createHTTPRequestWithTimeout creates a new HTTP request method to the specified endpoint
+// with a 5 minute timeout.
+// It returns the created HTTP request object, the context for handling request timeout,
+// and the function to cancel the context responsible for handling the request timeout.
+func createHTTPRequestWithTimeoutForWindowsV2(httpMethod string, endPoint string, jsonPayload []byte) (*http.Request, context.CancelFunc, error) {
+
+	req, err := createHttpRequestForWindowsV2(httpMethod, endPoint, jsonPayload, "application/json")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Implement a 5-minute timeout for requests to prevent indefinite hanging.
+	// A duration of 5 minutes is chosen as some requests, particularly uploads,
+	// can take a substantial amount of time to complete.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+
+	// TODO: This needs more testing to see how it performs and acts when actually combined
+	// TODO: with the timeout above.
+	req = req.WithContext(ctx)
+
+	return req, cancel, nil
+}
+
+func createHttpRequestForWindowsV2(httpMethod string, endPoint string, jsonPayload []byte, MIMEType string) (*http.Request, error) {
+	// req, err := http.NewRequest(httpMethod, apiURLFlask+"api/"+endPoint, nil)
+	req, err := http.NewRequest(httpMethod, apiURLLaravel+"api/windows/"+endPoint, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if httpMethod != "GET" {
+		// The payload is only set for None GET requests and it's given the no operation closer so it does not close the body as it's unnecessary
+		req.Body = io.NopCloser(bytes.NewBuffer(jsonPayload))
+		req.Header.Set("Content-Type", MIMEType)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	return req, nil
 }
 
 func prepareAndExecuteHTTPRequestWithTokenValidityV2(httpMethod, apiEndpoint string, jsonPayload []byte, retries int) (bytes.Buffer, error) {
@@ -11020,12 +11506,12 @@ func compressAndUploadLogs(uploadType string) error {
 	srcDir := filepath.Join(CymetricxPath, "logs")
 	destZipPath := filepath.Join(CymetricxPath, "logs.zip")
 
-	if err := ZipDirAndTruncate(srcDir, destZipPath); err != nil {
+	if err := zipDirAndTruncate(srcDir, destZipPath); err != nil {
 		return fmt.Errorf("failed to compress and truncate agent logs: %w", err)
 	}
 
 	endPoint := fmt.Sprintf("upload_logs_agents/%s/%s", id, uploadType)
-	responseBody, err := createAndExecuteUploadRequestV3(endPoint, destZipPath)
+	responseBody, err := createAndExecuteFileUploadRequest(endPoint, destZipPath)
 	if err != nil {
 		return fmt.Errorf("failed to execute upload logs request: %w", err)
 	}
@@ -11044,12 +11530,12 @@ func compressAndUploadLogs(uploadType string) error {
 	return nil
 }
 
-// ZipDir compresses the specified source directory (including all subdirectories and files)
+// zipDir compresses the specified source directory (including all subdirectories and files)
 // into a ZIP archive at the destination path. It preserves the directory structure, applies
 // Deflate compression to files, and includes directory entries to ensure the structure is
 // preserved even for empty directories. It takes two parameters: the source directory and the
 // destination path of the ZIP archive to create.
-func ZipDir(source, destination string) error {
+func zipDir(source, destination string) error {
 	outFile, err := os.Create(destination)
 	if err != nil {
 		return err
@@ -11122,13 +11608,13 @@ func ZipDir(source, destination string) error {
 	return err
 }
 
-// ZipDirAndTruncate compresses the specified source directory (including all subdirectories and files)
+// zipDirAndTruncate compresses the specified source directory (including all subdirectories and files)
 // into a ZIP archive at the destination path. After a file is added to the ZIP archive, its content
 // is truncated, effectively emptying the file without deleting it. This is particularly useful for
 // log files that are actively used by an application and cannot be deleted.
 // It takes two parameters: the source directory and the
 // destination path of the ZIP archive to create.
-func ZipDirAndTruncate(source, destination string) error {
+func zipDirAndTruncate(source, destination string) error {
 	outFile, err := os.Create(destination)
 	if err != nil {
 		return err
@@ -11233,7 +11719,7 @@ func realTimeWebsiteInteractionThreadV2(serialNumber string) {
 
 	log.Info().Msg("Starting real time website interaction thread...")
 
-	var isFirstRun bool = true // Flag to check if this is the first run
+	// var isFirstRun bool = true // Flag to check if this is the first run
 
 	for {
 
@@ -11241,11 +11727,11 @@ func realTimeWebsiteInteractionThreadV2(serialNumber string) {
 		// If not, we need to call real time.
 		// Call real time for the first time to get configuration and process instructions
 		// that were triggered while the agent was not running. Also, get the Feature settings.
-		if !isFirstRun {
-			sleepForRandomDelayDurationInMinutes(30, 60) // Sleep for 30-60 Minutes
-		} else {
-			isFirstRun = false // Set to false after the first run.
-		}
+		// if !isFirstRun {
+		sleepForRandomDelayDurationInMinutes(30, 60) // Sleep for 30-60 Minutes
+		// } else {
+		// 	isFirstRun = false // Set to false after the first run.
+		// }
 
 		if err := callRealTimeAndProcessFeatureSettings(serialNumber); err != nil {
 			log.Error().Err(err).Msg("Failed to call real time and process feature settings.")
@@ -11729,7 +12215,7 @@ func getAndcompressAndUploadWindowsServicesV2() error {
 	zipFileName := fmt.Sprintf("realservice_%s_uploadrealservice.zip", id)
 	zipFilePath := filepath.Join(CymetricxPath, "Compressed Files", zipFileName)
 
-	responseBody, err := createAndExecuteUploadRequestV3("real_service_win/"+id, zipFilePath)
+	responseBody, err := createAndExecuteFileUploadRequest("real_service_win/"+id, zipFilePath)
 	if err != nil {
 		return fmt.Errorf("error in uploading compressed Windows services: %w", err)
 	}
@@ -11808,11 +12294,7 @@ func runAndUploadCommandsOutputV2(commands string, commandID int, TypeOfStringBa
 	defer catchPanic()
 
 	// Defer a function to check if an error occurred, and log it
-	defer func() {
-		if err != nil {
-			log.Error().Err(err).Msg("Error in compressAndUploadCommandsOutput")
-		}
-	}()
+	defer logError(&err, "error in runAndUploadCommandsOutputV2")
 
 	log.Info().Str("Command:", commands).Msg(`Starting the process of running and uploading commands output...`)
 
@@ -11823,14 +12305,30 @@ func runAndUploadCommandsOutputV2(commands string, commandID int, TypeOfStringBa
 		}
 	}
 
-	// Execute the command and get the commandOutputRaw.
-	var commandOutputRaw []byte
-	commandOutputRaw, err = createAndRunPS1FileWithOutputForexeccommand("execommand"+strconv.Itoa(commandID)+".ps1", commands)
+	// var commandOutput string
+	commandOutput, err := runRMMCommand(commands, commandID)
 	if err != nil {
-		return err
+		return fmt.Errorf("error in runRMMCommand: %w", err)
 	}
 
-	jsonPayload, err := createCommandOutputPayload(strconv.Itoa(commandID), commandOutputRaw)
+	// Specific case where a command will output to a folder and need to zip and upload this
+	// folder directly.
+	if strings.Contains(commands, `cypasswordaudit`) {
+		srcDir := `C:\Program Files\CYMETRICX\cypasswordaudit`
+		destZipPath := filepath.Join(CymetricxPath, "Compressed Files", "cypasswordaudit.zip")
+
+		endPoint := fmt.Sprintf("upload-ntds/%s/%d", id, commandID)
+
+		// Call the new zipAndUploadFolder function
+		if err := zipAndUploadFolder(srcDir, destZipPath, endPoint); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	// jsonPayload, err := createCommandOutputPayload(strconv.Itoa(commandID), []byte(commandOutputRaw))
+	jsonPayload, err := createCommandOutputPayload(commandID, commandOutput)
 	if err != nil {
 		return err
 	}
@@ -11840,7 +12338,7 @@ func runAndUploadCommandsOutputV2(commands string, commandID int, TypeOfStringBa
 		return err
 	}
 
-	responseBody, err := createAndExecuteUploadRequestV3("upload_output/"+id, filePath)
+	responseBody, err := createAndExecuteFileUploadRequest("upload_output/"+id, filePath)
 	if err != nil {
 		return fmt.Errorf("error in uploadoutput: %w", err)
 	}
@@ -11852,6 +12350,51 @@ func runAndUploadCommandsOutputV2(commands string, commandID int, TypeOfStringBa
 	log.Info().Str("Command:", commands).Msg("Successfully ran and uploaded commands output.")
 
 	return nil
+}
+
+// zipAndUploadFolder zips the folder at srcDir and uploads it to the specified endpoint.
+// It also deletes the zip file after a successful upload.
+func zipAndUploadFolder(srcDir, destZipPath, endPoint string) error {
+	// Step 1: Zip the folder
+	if err := zipDir(srcDir, destZipPath); err != nil {
+		return fmt.Errorf("error in zipping %s folder: %w", srcDir, err)
+	}
+
+	// Step 2: Prepare the endpoint and upload the zip file
+	responseBody, err := createAndExecuteFileUploadRequest(endPoint, destZipPath)
+	if err != nil {
+		return fmt.Errorf("failed to execute upload request for %s: %w", srcDir, err)
+	}
+
+	// Step 3: Handle the response
+	if err := readGeneralReponseBody(responseBody); err != nil {
+		return fmt.Errorf("failed to upload agent logs for %s: %w", srcDir, err)
+	}
+
+	// Step 4: Delete the zip file after the successful upload
+	if err := os.Remove(destZipPath); err != nil {
+		return fmt.Errorf("failed to delete %s zip file: %w", destZipPath, err)
+	}
+
+	// Step 5: Delete the folder after the successful upload
+	if err := os.RemoveAll(srcDir); err != nil {
+		return fmt.Errorf("failed to delete %s folder: %w", srcDir, err)
+	}
+
+	log.Info().Msgf("Successfully zipped and uploaded folder %s.", srcDir)
+
+	return nil
+}
+
+func runRMMCommand(commands string, commandID int) (string, error) {
+	fileName := fmt.Sprintf("exec-command%d.ps1", commandID)
+	// commandOutput, err := createAndRunPS1FileWithOutputForExecCommand(fileName, commands)
+	commandOutput, err := createAndRunPS1FileWithOutput(fileName, commands)
+	if err != nil {
+		return "", fmt.Errorf("error in creating and running bash file with output: %w", err)
+	}
+
+	return string(commandOutput), nil
 }
 
 type ApiGeneralResponse struct {
@@ -11873,10 +12416,35 @@ func readGeneralReponseBody(responseBody bytes.Buffer) error {
 	return nil
 }
 
-func createCommandOutputPayload(commandID string, commandOutputRaw []byte) ([]byte, error) {
+// func createCommandOutputPayload(commandID string, commandOutputRaw []byte) ([]byte, error) {
+// 	commandOutputPayload := CommandOutputPayload{
+// 		CommandID: commandID,
+// 		Output:    b64.StdEncoding.EncodeToString(commandOutputRaw),
+// 	}
+
+// 	jsonPayload, err := json.Marshal(commandOutputPayload)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to marshel CommandOutputPayload: %w", err)
+// 	}
+
+// 	return jsonPayload, nil
+
+// }
+
+func createCommandOutputPayload(commandID int, commandOutputRaw string) ([]byte, error) {
+	// Convert CommandId to string
+	commandIDString := strconv.Itoa(commandID)
+	// Convert CommandOutputRaw to []byte and encode it to base64
+	commandOutput := b64.StdEncoding.EncodeToString([]byte(commandOutputRaw))
+
+	type CommandOutputPayload struct {
+		CommandID string `json:"commandID"`
+		Output    string `json:"output"`
+	}
+
 	commandOutputPayload := CommandOutputPayload{
-		CommandID: commandID,
-		Output:    b64.StdEncoding.EncodeToString(commandOutputRaw),
+		CommandID: commandIDString,
+		Output:    commandOutput,
 	}
 
 	jsonPayload, err := json.Marshal(commandOutputPayload)
@@ -11912,7 +12480,7 @@ func getAndCompressAndUploadListTaskMangerV2() error {
 	zipFileName := fmt.Sprintf("tasklist_%s_uploadtasklist.zip", id)
 	ZipFilePath := filepath.Join(CymetricxPath, "Compressed Files", zipFileName)
 
-	responseBody, err := createAndExecuteUploadRequestV3("task_list_win/"+id, ZipFilePath)
+	responseBody, err := createAndExecuteFileUploadRequest("task_list_win/"+id, ZipFilePath)
 	if err != nil {
 		return err
 	}
@@ -11952,7 +12520,7 @@ func getAndCompressAndUploadWindowsInstallerApplicationsV2() error {
 	zipFileName := fmt.Sprintf("appmanager_%s_uploadappmanager.zip", id)
 	zipFilePath := filepath.Join(CymetricxPath, "Compressed Files", zipFileName)
 
-	responseBody, err := createAndExecuteUploadRequestV3("app_manager_win/"+id, zipFilePath)
+	responseBody, err := createAndExecuteFileUploadRequest("app_manager_win/"+id, zipFilePath)
 	if err != nil {
 		return err
 	}
@@ -11978,7 +12546,7 @@ func compressAndUploadWindowsCertificatesV2() error {
 
 	// sleepForRandomDelayDuration(minimalUploadInterval, maximalUploadInterval)
 
-	responseBody, err := createAndExecuteUploadRequestV3("certs_win/"+id, zipFilePath)
+	responseBody, err := createAndExecuteFileUploadRequest("certs_win/"+id, zipFilePath)
 	if err != nil {
 		return fmt.Errorf("error in certswin: %w", err)
 	}
