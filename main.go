@@ -202,7 +202,7 @@ var minimalMonitoringInterval = 10 // In minutes (10 minutes)
 var maximalMonitoringInterval = 15 // In minutes (20 minutes)
 var timeUSN = 60                   // In minutes (60 minutes)
 
-func main1() {
+func main() {
 
 	// Catch any panic and logs it with its stack trace.
 	defer catchAndRestartPanicForFunction(main)
@@ -1904,6 +1904,7 @@ func generateLoginDataV1(passwordlogin string) string {
 // If so, it would break, leading to the agnet stopping and exiting
 // Only then, the service would run it again by itself, cuz this is what services do
 func holdingAgentForever() {
+
 	log.Info().Msg("Starting the holding agent forever loop.")
 	for {
 		time.Sleep(5 * time.Minute)
@@ -5515,8 +5516,6 @@ func getInstalledApplicationsForAllAndCurrentUserV2(userID string) (string, erro
 	if err != nil {
 		return "", err
 	}
-
-	fmt.Println(string(jsonOutput))
 
 	return string(jsonOutput), nil
 
