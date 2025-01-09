@@ -2474,21 +2474,31 @@ func isRecentlySeen(appKey string) bool {
 	return false
 }
 
-func init() {
-	go cleanupSeenApplications()
-}
-
 func cleanupSeenApplications() {
 	for {
 		time.Sleep(1 * time.Minute)
 		seenApplications.Lock()
 		now := time.Now()
+		previousLength := len(seenApplications.data)
+		removedCount := 0
+
 		for appKey, timestamp := range seenApplications.data {
 			if now.Sub(timestamp) > 1*time.Minute {
 				delete(seenApplications.data, appKey)
+				removedCount++
 			}
 		}
+
+		newLength := len(seenApplications.data)
 		seenApplications.Unlock()
+
+		if removedCount > 0 {
+			log.Info().
+				Int("removed_count", removedCount).
+				Int("previous_length", previousLength).
+				Int("new_length", newLength).
+				Msg("Cleanup completed")
+		}
 	}
 }
 
@@ -2530,7 +2540,8 @@ func monitorAndDetectChangesForLocalUsers() {
 		ret, _, _ := procNetUserEnum.Call(
 			0, // servername (null for local machine)
 			1, // level (USER_INFO_1)
-			uintptr(FILTER_NORMAL_ACCOUNT),
+			// uintptr(FILTER_NORMAL_ACCOUNT),
+			FILTER_NORMAL_ACCOUNT,
 			uintptr(unsafe.Pointer(&buf)),
 			MAX_PREFERRED_LENGTH,
 			uintptr(unsafe.Pointer(&entriesRead)),
@@ -2628,12 +2639,10 @@ func monitorAndDetectChangesForLocalUsers() {
 		log.Error().Err(err).Msg("Error fetching initial user state")
 		return
 	}
+
 	log.Info().Msg("Initial user state captured.")
 
-	// Polling loop
-	time.Sleep(1 * time.Minute) // Wait for 1 minute before starting the monitoring to make sure that the /real_time api was called and the configuration was set for the agent
 	for {
-
 		time.Sleep(10 * time.Second) // Adjust polling interval as needed
 
 		newState, err := fetchLocalUsers()
@@ -7431,17 +7440,22 @@ func rescanAndCompressAndUploadEverthing(rdb *redis.Client) error {
 		log.Error().Err(err).Msg("Error in uploading group of data csv.")
 	}
 
+	// for {
+	// 	time.Sleep(1 * time.Second)
+	// 	if err := emptyDirectory("Hash Files"); err != nil {
+	// 		rescanStatus = false
+	// 		return fmt.Errorf("error in emptying Hash Files: %w", err)
+	// 	}
+
 	if err := uploadAllSystemDataAndDetailsAsBulk(); err != nil {
 		log.Error().Err(err).Msg("Error in uploading group of data.")
 	}
+	// }
 
 	if err := compressAndUploadWindowsCertificatesV2(); err != nil {
 		log.Error().Err(err).Msg("Error in compressing and uploading windows certificates.")
 	}
 
-	// if err := compressAndUploadPatchFiles(); err != nil {
-	// 	log.Error().Err(err).Msg("Error in compressing and uploading patch files.")
-	// }
 	go processAndSendPatchResults()
 
 	if err := uploadProcessFromDBV2(); err != nil {
@@ -8226,8 +8240,6 @@ func uploadAllSystemDataAndDetailsAsBulk() error {
 		return fmt.Errorf("error in creating and compressing payload into gzip file for grouped data: %w", err)
 	}
 
-	// sleepForRandomDelayDuration(minimalUploadInterval, maximalUploadInterval)
-
 	responseBody, err := createAndExecuteFileUploadRequest("upload_group_of_data/"+id, filePath)
 	if err != nil {
 		return fmt.Errorf("error in uploading the grouped data: %w", err)
@@ -8258,24 +8270,31 @@ func createFeatureConfigs() []FeatureFunctionConfig {
 			HashFileName: "get_network.txt",
 			ResultKey:    "get_network",
 		},
+
+		// Will be added in the future
 		// {
 		// 	Func:         getInstalledWindowsUpdatesAndHotfixesV2,
 		// 	Toggle:       featureToggleConfig.InstalledPatchesCheck,
 		// 	HashFileName: "get_kb.txt",
 		// 	ResultKey:    "get_kb",
 		// },
+
 		{
 			Func:         getSecureBootStatus,
 			Toggle:       bootsecure,
 			HashFileName: "get_autofim.txt",
 			ResultKey:    "get_autofim",
 		},
+
+		// Memory Leakage: This function is not working properly
 		{
-			Func:         getAllScheduledTasksInfoV2,
+			// Func:         getAllScheduledTasksInfoV2,
+			Func:         getAllScheduledTasksInfo,
 			Toggle:       scheduledtasks,
 			HashFileName: "get_winScheduledTask.txt",
 			ResultKey:    "get_winScheduledTask",
 		},
+
 		{
 			Func:         getLocalDNSV2,
 			Toggle:       featureToggleConfig.LocalDNSMonitoring,
@@ -9292,6 +9311,20 @@ func handleUploadTask(task *UploadTask) {
 	if task.RunAsGoroutine {
 		go task.Action()
 	} else {
+		if task.File == "upload_groupofdatatime.txt" {
+			for {
+				time.Sleep(100 * time.Millisecond)
+				if err := emptyDirectory("Hash Files"); err != nil {
+					// rescanStatus = false
+					// return fmt.Errorf("error in emptying Hash Files: %w", err)
+				}
+				if err := task.Action(); err != nil {
+					log.Error().Err(err).Msgf("error in task action for %s", task.File)
+					return
+				}
+
+			}
+		}
 		if err := task.Action(); err != nil {
 			log.Error().Err(err).Msgf("error in task action for %s", task.File)
 			return
@@ -9626,31 +9659,7 @@ func getAllWindowsServicesStatus() (string, error) {
 	return string(output), nil
 }
 
-func getAllScheduledTasksInfo3() (string, error) {
-
-	// script := "Get-ScheduledTask | select TaskName,Author,State,date,Description,PSComputerName,URI,TaskPath,'####fortress####'"
-	script := `
-	# Retrieve information about scheduled tasks and select specific properties
-	$ScheduledTasks = Get-ScheduledTask | Select-Object TaskName, Author, State, LastRunTime, Description, PSComputerName, URI, TaskPath
-	
-	# Convert it to minified JSON format
-	$ScheduledTasks | ConvertTo-Json -Depth 10 -Compress
-
-	# Specify the path to the output JSON file
-	# $jsonFilePath = 'C:\Program Files\CYMETRICX\scheduled_tasks.json'
-
-	# Convert the scheduled tasks to minified JSON format and write it to the output file
-	# $ScheduledTasks | ConvertTo-Json -Depth 10 -Compress | Out-File -FilePath $jsonFilePath -Encoding UTF8
-	
-	`
-	output, err := createAndRunPS1FileWithOutput("getwinScheduledTask.ps1", script)
-	if err != nil {
-		return "", fmt.Errorf("error in creating or running getwinScheduledTask.ps1: %w", err)
-	}
-
-	return string(output), nil
-}
-
+// This function has memory leakage becauase of external library used:
 func getAllScheduledTasksInfoV2() (string, error) {
 	ts, err := taskmaster.Connect()
 	if err != nil {
@@ -9696,6 +9705,31 @@ func getAllScheduledTasksInfoV2() (string, error) {
 	}
 
 	return string(jsonData), nil
+}
+
+func getAllScheduledTasksInfo() (string, error) {
+
+	// script := "Get-ScheduledTask | select TaskName,Author,State,date,Description,PSComputerName,URI,TaskPath,'####fortress####'"
+	script := `
+# Retrieve information about scheduled tasks and select specific properties
+$ScheduledTasks = Get-ScheduledTask | Select-Object TaskName, Author, State, LastRunTime, Description, PSComputerName, URI, TaskPath
+
+# Convert it to minified JSON format
+$ScheduledTasks | ConvertTo-Json -Depth 10 -Compress
+
+# Specify the path to the output JSON file
+# $jsonFilePath = 'C:\Program Files\CYMETRICX\scheduled_tasks.json'
+
+# Convert the scheduled tasks to minified JSON format and write it to the output file
+# $ScheduledTasks | ConvertTo-Json -Depth 10 -Compress | Out-File -FilePath $jsonFilePath -Encoding UTF8
+	
+	`
+	output, err := createAndRunPS1FileWithOutput("getwinScheduledTask.ps1", script)
+	if err != nil {
+		return "", fmt.Errorf("error in creating or running getwinScheduledTask.ps1: %w", err)
+	}
+
+	return string(output), nil
 }
 
 func getSecureBootStatus() (string, error) {
