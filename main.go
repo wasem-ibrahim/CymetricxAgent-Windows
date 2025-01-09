@@ -9311,20 +9311,6 @@ func handleUploadTask(task *UploadTask) {
 	if task.RunAsGoroutine {
 		go task.Action()
 	} else {
-		if task.File == "upload_groupofdatatime.txt" {
-			for {
-				time.Sleep(100 * time.Millisecond)
-				if err := emptyDirectory("Hash Files"); err != nil {
-					// rescanStatus = false
-					// return fmt.Errorf("error in emptying Hash Files: %w", err)
-				}
-				if err := task.Action(); err != nil {
-					log.Error().Err(err).Msgf("error in task action for %s", task.File)
-					return
-				}
-
-			}
-		}
 		if err := task.Action(); err != nil {
 			log.Error().Err(err).Msgf("error in task action for %s", task.File)
 			return
