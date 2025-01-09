@@ -7440,17 +7440,9 @@ func rescanAndCompressAndUploadEverthing(rdb *redis.Client) error {
 		log.Error().Err(err).Msg("Error in uploading group of data csv.")
 	}
 
-	// for {
-	// 	time.Sleep(1 * time.Second)
-	// 	if err := emptyDirectory("Hash Files"); err != nil {
-	// 		rescanStatus = false
-	// 		return fmt.Errorf("error in emptying Hash Files: %w", err)
-	// 	}
-
 	if err := uploadAllSystemDataAndDetailsAsBulk(); err != nil {
 		log.Error().Err(err).Msg("Error in uploading group of data.")
 	}
-	// }
 
 	if err := compressAndUploadWindowsCertificatesV2(); err != nil {
 		log.Error().Err(err).Msg("Error in compressing and uploading windows certificates.")
@@ -8286,8 +8278,8 @@ func createFeatureConfigs() []FeatureFunctionConfig {
 			ResultKey:    "get_autofim",
 		},
 
-		// Memory Leakage: This function is not working properly
 		{
+			// Memory Leakage: This function is not working properly
 			// Func:         getAllScheduledTasksInfoV2,
 			Func:         getAllScheduledTasksInfo,
 			Toggle:       scheduledtasks,
