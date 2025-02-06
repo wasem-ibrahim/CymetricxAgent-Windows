@@ -36,8 +36,8 @@ func openRegistryKey(fullPath string) (registry.Key, error) {
 	return registry.OpenKey(rootKey, subPath, registry.QUERY_VALUE)
 }
 
-// keyOrItemExists checks if a registry key or a key item exists at the given path
-func keyOrItemExists(registryPath, keyItem string) bool {
+// KeyOrItemExists checks if a registry key or a key item exists at the given path
+func KeyOrItemExists(registryPath, keyItem string) bool {
 	key, err := openRegistryKey(registryPath)
 	if err != nil {
 		if err == registry.ErrNotExist {
@@ -78,7 +78,7 @@ func Mainrc() {
 	}
 
 	for _, check := range registryChecks {
-		if keyOrItemExists(check.Path, check.Item) {
+		if KeyOrItemExists(check.Path, check.Item) {
 			if check.Item != "" {
 				fmt.Printf("Registry key %s and item %s exist.\n", check.Path, check.Item)
 			} else {
@@ -127,7 +127,7 @@ func GetRegCheck(obj map[string]string, variables map[string]string) (map[string
 	var status string
 
 	if valueType == "POLICY_TEXT" {
-		keyOrValueExists := keyOrItemExists(valueData, keyItem)
+		keyOrValueExists := KeyOrItemExists(valueData, keyItem)
 		if !keyOrValueExists && regOption == "MUST_EXIST" {
 			return resultMap, fmt.Errorf("registry key %s does not exist", valueData)
 		}

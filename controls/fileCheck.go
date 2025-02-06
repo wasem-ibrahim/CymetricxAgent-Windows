@@ -20,7 +20,6 @@ func expandEnvironmentVariables(path string) string {
 func fileExists(filePath string) bool {
 	expandedPath := expandEnvironmentVariables(filePath)
 
-	fmt.Println("Expanded path:", expandedPath)
 	_, err := os.Stat(expandedPath)
 	if os.IsNotExist(err) {
 		return false

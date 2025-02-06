@@ -67,7 +67,8 @@ import (
 )
 
 var (
-	complience bool
+	complience   bool
+	isDeletedIIS bool
 
 	keepAlive int
 )
@@ -719,34 +720,44 @@ func createScriptToDeleteServicesAndUninstallOldAgent(packageName string) string
 	return uninstallScript
 }
 
-// getSCPath finds the path to sc.exe on the system which is the service controller
-// for windows responsible to Create, Start, Stop, Query or Delete any Windows SERVICE.
-func getSCPath() string {
-	log.Info().Msg("Attempting to find sc path...")
+func findCommandPath(commandName string) string {
+	log.Info().Msgf("Attempting to find %s path...", commandName)
 
-	// Define the possible paths to sc.exe
+	// Define the possible paths to check (in case SystemRoot isn't set, we also hardcode "C:\WINDOWS").
 	possiblePaths := []string{
-		filepath.Join("C:\\", "WINDOWS", "system32", "sc.exe"),
-		filepath.Join(os.Getenv("SystemRoot"), "system32", "sc.exe"),
+		filepath.Join("C:\\", "WINDOWS", "system32", commandName),
+		filepath.Join(os.Getenv("SystemRoot"), "system32", commandName),
 	}
 
-	// Check each possible path and return the first one that exists
+	// Check each possible path; if the file exists, return immediately.
 	for _, path := range possiblePaths {
 		if fileExists(path) {
-			log.Info().Msgf("Found sc path: %s", path)
+			log.Info().Msgf("Found %s path: %s", commandName, path)
 			return path
 		}
 	}
 
-	// If no path was found, use the sc.exe in the PATH environment variable
-	scFilePath, err := exec.LookPath("sc.exe")
+	// Fallback to PATH environment variable search.
+	foundPath, err := exec.LookPath(commandName)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to find sc path. Using default path.")
+		log.Error().Err(err).Msgf("Failed to find %s path. Using default path.", commandName)
 		return ""
 	}
 
-	log.Info().Msgf("Found sc path: %s", scFilePath)
-	return scFilePath
+	log.Info().Msgf("Found %s path: %s", commandName, foundPath)
+	return foundPath
+}
+
+// getSCPath finds the path to sc.exe on the system which is the service controller
+// for windows responsible to Create, Start, Stop, Query or Delete any Windows SERVICE.
+func getSCPath() string {
+	return findCommandPath("sc.exe")
+}
+
+// getNetCommandPath finds the path to net.exe on the system which is used to
+// manage network resources.
+func getNetCommandPath() string {
+	return findCommandPath("net.exe")
 }
 
 // uninstallOldCymetricxPackagesBackup uninstalls any cymetricx packages that are not the current version.
@@ -1711,7 +1722,8 @@ func initializeAndAuthenticate(iniData ini.IniConfig) string {
 		log.Fatal().Msg("Serial is not valid.")
 	}
 
-	id, err = generateIDAndWriteItToIDTxtFile()
+	// id, err = generateIDAndWriteItToIDTxtFile()
+	id, err = generateIDAndWriteItToIDTxtFile2("id")
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to generate UUID and write it to id.txt file.")
 	}
@@ -1759,7 +1771,8 @@ func handleDuplicatedUUID() error {
 
 	// Regenerate the ID and write it to the id.txt file
 	var err error
-	id, err = generateIDAndWriteItToIDTxtFile()
+	// id, err = generateIDAndWriteItToIDTxtFile()
+	id, err = generateIDAndWriteItToIDTxtFile2("id")
 	if err != nil {
 		return fmt.Errorf("failed to generate UUID and write it to id.txt file: %w", err)
 	}
@@ -2759,10 +2772,23 @@ func startSystemDetailesUploadProcess() {
 	}
 }
 
+// fileExists checks if a file exists at the given path
+func expandEnvironmentVariables(path string) string {
+	for _, env := range os.Environ() {
+		pair := strings.SplitN(env, "=", 2)
+		if len(pair) == 2 {
+			path = strings.ReplaceAll(path, "%"+pair[0]+"%", pair[1])
+		}
+	}
+	return path
+}
+
 // fileExists checks if a file exists and is not a directory
 // and returns a boolean value indicating whether the file exists.
 func fileExists(filePath string) bool {
-	info, err := os.Stat(filePath)
+	expandedPath := expandEnvironmentVariables(filePath)
+
+	info, err := os.Stat(expandedPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false
 	}
@@ -3606,6 +3632,61 @@ func generateIDAndWriteItToIDTxtFile() (string, error) {
 	return writeDataToIDTxtFile(uniqueID, uuid)
 }
 
+func generateIDAndWriteItToIDTxtFile2(baseFileName string) (string, error) {
+	log.Info().Msg("Attempting to retrieve user ID from id.txt file.")
+
+	uuid := ""
+	if baseFileName == "id" {
+		var err error
+		uuid, err = getWindowsUUID()
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to get UUID from Windows.")
+		}
+	}
+
+	uniqueID, err := getUserIDFromIDTxtFile2(baseFileName)
+	idFileContent := ""
+	if baseFileName == "id" {
+		idFileContent = fmt.Sprintf("%s,,,,,,\nAgent Version: %s\nUUID: %s", uniqueID, AgentVersion, uuid)
+	} else {
+		idFileContent = fmt.Sprintf("%s,,,,,,", uniqueID)
+	}
+	if err == nil {
+		// If the UUID was successfully retrieved from id.txt file, return it.
+		return writeDataToIDTxtFile2(idFileContent, uniqueID, baseFileName)
+	}
+
+	log.Warn().Err(err).Msg("Failed to retrieve user ID from id.txt, generating a new UUID.")
+
+	uniqueID = generateUUID()
+
+	log.Debug().Msgf("Generated new UUID: %s.", uniqueID)
+
+	return writeDataToIDTxtFile2(idFileContent, uniqueID, baseFileName)
+}
+
+// generateIDAndWriteItToIDTxtFile either generates a new UUID and writes it to
+// the id.txt file (if it doesn't already exist), or retrieves the existing UUID
+// from the id.txt  file. In both scenarios, the UUID and the Agent Version are
+// written to the id.txt file. It returns the ID.
+func generateProductIDAndWriteItToProductTxtFile(baseFileName string) (string, error) {
+	log.Info().Msg("Attempting to retrieve user ID from id.txt file.")
+
+	uniqueID, err := getProductIDFromProductIDTxtFile(baseFileName)
+	if err == nil {
+		// If the UUID was successfully retrieved from id.txt file, return it.
+		return writeDataToProductIDTxtFile(uniqueID, baseFileName)
+	}
+
+	log.Warn().Err(err).Msg("Failed to retrieve user ID from id.txt, generating a new UUID.")
+
+	uniqueID = generateUUID()
+
+	log.Debug().Msgf("Generated new UUID: %s.", uniqueID)
+
+	return writeDataToProductIDTxtFile(uniqueID, baseFileName)
+}
+
 // collectSystemConfigurationDetailsV2 captures the system information and returns it as a SystemData struct
 func collectSystemConfigurationDetailsV2() SystemDetails {
 	log.Info().Msg("Initiating system information capture.")
@@ -3729,6 +3810,78 @@ func getUserIDFromIDTxtFile() (string, error) {
 	return uniqeID, nil
 }
 
+func getUserIDFromIDTxtFile2(baseFileName string) (string, error) {
+	log.Info().Msg("Attempting to open id.txt file for reading...")
+
+	fileName := fmt.Sprintf("%s.txt", baseFileName)
+	idTxtPath := filepath.Join(CymetricxPath, fileName)
+
+	file, err := os.Open(idTxtPath)
+	if err != nil {
+		return "", fmt.Errorf("error opening %s file. %w", fileName, err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		return "", fmt.Errorf("no content found in %s file", fileName)
+	}
+
+	lineList := strings.SplitN(scanner.Text(), ",", 2)
+
+	// If the file is empty or contains only commas, return an error.
+	if len(lineList) < 2 {
+		return "", fmt.Errorf("invalid content in %s file", fileName)
+	}
+
+	// The first element in the lineList is the UUID.
+	uniqeID := lineList[0]
+
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("error occurred while scanning %s file. %w", fileName, err)
+	}
+
+	log.Info().Str("ID:", uniqeID).Msgf("Successfully retrieved ID from %s file.", fileName)
+	return uniqeID, nil
+}
+
+// getUserIDFromIDTxtFile retrieves the user ID from /etc/cymetricx/id.txt file.
+// The first line is the UUID combined with some commas.
+func getProductIDFromProductIDTxtFile(productName string) (string, error) {
+	log.Info().Msg("Attempting to open id.txt file for reading...")
+
+	productFilePath := fmt.Sprintf("%s.txt", productName)
+	idTxtPath := filepath.Join(CymetricxPath, productFilePath)
+
+	file, err := os.Open(idTxtPath)
+	if err != nil {
+		return "", fmt.Errorf("error opening id.txt file. %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		return "", fmt.Errorf("no content found in id.txt file")
+	}
+
+	lineList := strings.SplitN(scanner.Text(), ",", 2)
+
+	// If the file is empty or contains only commas, return an error.
+	if len(lineList) < 2 {
+		return "", fmt.Errorf("invalid content in id.txt file")
+	}
+
+	// The first element in the lineList is the UUID.
+	uniqeID := lineList[0]
+
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("error occurred while scanning id.txt file. %w", err)
+	}
+
+	log.Info().Str("ID:", uniqeID).Msg("Successfully retrieved ID from id.txt file.")
+	return uniqeID, nil
+}
+
 // writeDataToIDTxtFile writes the ID and the Agent Version to the id.txt file
 // in a certain format.
 func writeDataToIDTxtFile(uniqueID, UUID string) (string, error) {
@@ -3745,6 +3898,39 @@ func writeDataToIDTxtFile(uniqueID, UUID string) (string, error) {
 
 	log.Info().Msgf("Successfully wrote data to id.txt file")
 	return uniqueID, nil
+}
+func writeDataToIDTxtFile2(idFileContent, uniqueID, baseFileName string) (string, error) {
+	// Added these commas for backwards compatibility (should be deleted in the
+	// future since they are unnecessary).
+	// Added the Agent version to the id.txt file so we could know which version
+	// of the agent is running on the machine.
+	fileName := fmt.Sprintf("%s.txt", baseFileName)
+	idFilePath := filepath.Join(CymetricxPath, fileName)
+
+	if err := createFileWithPermissionsAndWriteToIt(idFilePath, idFileContent, 0644); err != nil {
+		return "", fmt.Errorf("error writing the new UUID to id.txt file. %w", err)
+	}
+
+	log.Info().Msgf("Successfully wrote data to id.txt file")
+	return uniqueID, nil
+}
+
+func writeDataToProductIDTxtFile(productID, productName string) (string, error) {
+	// Added these commas for backwards compatibility (should be deleted in the
+	// future since they are unnecessary).
+	// Added the Agent version to the id.txt file so we could know which version
+	// of the agent is running on the machine.
+	productFileContent := fmt.Sprintf("%s,,,,,,", productID)
+
+	productFilePath := fmt.Sprintf("%s.txt", productName)
+	productFileFullPath := filepath.Join(CymetricxPath, productFilePath)
+
+	if err := createFileWithPermissionsAndWriteToIt(productFileFullPath, productFileContent, 0644); err != nil {
+		return "", fmt.Errorf("error writing the new UUID to id.txt file. %w", err)
+	}
+
+	log.Info().Msgf("Successfully wrote data to %s file", productFilePath)
+	return productID, nil
 }
 
 // getCurrentUTCTimeFormatted returns the current UTC time in the format "2006-01-02 15:04"
@@ -6335,8 +6521,10 @@ func getLocalUsersFromWindowsV2_1() ([]byte, error) {
 		userName := userBlock["Name"]
 		commandArgs := []string{`user`, userName}
 
+		netCommandPath := getNetCommandPath()
+
 		// Get the net user for the current user
-		netusers, err := execCommandWithOutputRaw("net", commandArgs...)
+		netusers, err := execCommandWithOutputRaw(netCommandPath, commandArgs...)
 		if err != nil {
 			return nil, fmt.Errorf("error executing net user command: %w", err)
 		}
@@ -6949,7 +7137,11 @@ func runRecheckin(rdb *redis.Client) error {
 		log.Error().Err(err).Msg("Error while removing uploadiis.txt file.")
 	}
 
-	processIISControlsV2()
+	if !isDeletedIIS {
+		processIISControlsV2()
+	}
+
+	processBenchmarkAndAuditResultForProducts("google_chrome")
 
 	//! If google chrome installed (using the logic in the `check_type` in the json that i got from Moatadil), grab the assets for google chrom from the server get request and then upload them.
 	//! Same goes for edge and apahe tomcat and others.
@@ -7164,6 +7356,150 @@ func processBenchmarkAndAuditResultV2() (bool, error) {
 
 	log.Info().Msg("Successfully processed benchmark and audit result v2.")
 	return false, nil
+}
+
+// processBenchmarkAndAuditResultV2 processes the benchmark and audit result and uploads it to the server
+// If the returned boolean is true, it means that the benchmark is old and no controls were found.
+// That means we need to use the old functions to get the audit result.
+func processBenchmarkAndAuditResultForProducts(productName string) error {
+	log.Info().Msg("Starting to process benchmark and audit result for products.")
+
+	if err := checkIfProductInstalled(productName); err != nil {
+		return err
+	}
+
+	fmt.Println("Product Name: ", productName)
+	// productID, err := generateProductIDAndWriteItToProductTxtFile(productName)
+	productID, err := generateIDAndWriteItToIDTxtFile2(productName)
+	if err != nil {
+		return fmt.Errorf("failed to generate product ID: %w", err)
+	}
+
+	jsonPayload1 := map[string]interface{}{
+		"productID":   productID,
+		"productName": productName,
+	}
+
+	// jsonify the jsonPayload:
+	jsonPayload, err := json.Marshal(jsonPayload1)
+	if err != nil {
+		return fmt.Errorf("failed to marshal jsonPayload: %w", err)
+	}
+
+	fmt.Println("JSON Payload: ", string(jsonPayload))
+
+	productResponseBody, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", "upload_product/"+id, jsonPayload, 10)
+	if err != nil {
+		log.Error().Err(err).Msg("Error while executing upload request for IIS.")
+	}
+
+	if err := readGeneralReponseBody(productResponseBody); err != nil {
+		return fmt.Errorf("failed to upload product: %w", err)
+	}
+
+	endPoint := "get-asset-controls/" + productID
+	responseBody, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("GET", endPoint, nil, 10)
+	if err != nil {
+		exitCommandCheck = true
+		return fmt.Errorf("failed to get asset controls for products: %w", err)
+	}
+
+	responseBodyStr := responseBody.String()
+	if responseBodyStr == "" {
+		log.Info().Msg("No asset controls to recheck for products.")
+		exitCommandCheck = true
+		return nil
+	}
+
+	var responseBodyData interface{}
+	err = json.Unmarshal(responseBody.Bytes(), &responseBodyData)
+	if err != nil {
+		exitCommandCheck = true
+		return fmt.Errorf("failed to unmarshal response body for products: %w", err)
+	}
+
+	jsonDataOutput := processControlsData(responseBodyStr)
+
+	endPoint = "audit-products-result/" + productID
+	_, err = prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", endPoint, jsonDataOutput, 10)
+	if err != nil {
+		exitCommandCheck = true
+		return fmt.Errorf("failed to upload audit result for products: %w", err)
+	}
+
+	exitCommandCheck = true
+
+	log.Info().Msg("Successfully processed benchmark and audit result for products")
+	return nil
+}
+
+func checkIfProductInstalled(productName string) error {
+	var productCheckers = map[string]func() error{
+		"google_chrome":  checkIfChromeInstalled,
+		"microsoft_edge": checkIfEdgeInstalled,
+		"office_2016":    checkIfOffice2016Installed,
+	}
+
+	log.Info().Msgf("Checking if %s is installed.", productName)
+
+	checker, exists := productCheckers[productName]
+	if !exists {
+		return fmt.Errorf("failed to check if %s is installed", productName)
+	}
+	if err := checker(); err != nil {
+		return fmt.Errorf("failed to check if %s is installed: %w", productName, err)
+	}
+
+	log.Info().Msgf("%s is installed.", productName)
+	return nil
+}
+
+func checkIfChromeInstalled() error {
+	paths := []struct {
+		registryPath string
+		keyItem      string
+	}{
+		{`HKLM\Software\Clients\Startmenuinternet\Google Chrome\Capabilities`, "ApplicationName"},
+		{`HKLM\Software\Microsoft\Windows\Currentversion\Uninstall\Google Chrome`, "DisplayName"},
+	}
+
+	for _, path := range paths {
+		if controls.KeyOrItemExists(path.registryPath, path.keyItem) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("google chrome is not installed")
+}
+
+func checkIfEdgeInstalled() error {
+	ps1Script := `Get-AppxPackage -Name Microsoft.MicrosoftEdge | Select 'Name' | Format-List`
+	ps1Path := filepath.Join(CymetricxPath, "checkEdge.ps1")
+	output, err := createAndRunPS1FileWithOutput(ps1Path, ps1Script)
+	if err != nil {
+		return fmt.Errorf("failed to check if Microsoft Edge is installed: %w", err)
+	}
+
+	if strings.Contains(string(output), "Name : Microsoft.MicrosoftEdge") || fileExists(`%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe`) {
+		return nil
+	}
+
+	return fmt.Errorf("microsoft edge is not installed")
+}
+
+func checkIfOffice2016Installed() error {
+	ps1Script := `$(Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* | Select-Object DisplayName) + $(Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Select-Object DisplayName)`
+	ps1Path := filepath.Join(CymetricxPath, "checkOffice2016.ps1")
+	output, err := createAndRunPS1FileWithOutput(ps1Path, ps1Script)
+	if err != nil {
+		return fmt.Errorf("failed to check if Office 2016 is installed: %w", err)
+	}
+
+	if strings.Contains(string(output), "2016") {
+		return nil
+	}
+
+	return fmt.Errorf("office 2016 is not installed")
 }
 
 func checkIfOldBenchmarkResponse(data interface{}) bool {
@@ -9273,8 +9609,10 @@ func handleBenchmarkAndAuditResult() {
 		processBenchmarkAndAuditResult()
 	}
 
-	if err := processIISControlsV2(); err != nil {
-		log.Error().Err(err).Msg("error in processIISControlsV2")
+	if !isDeletedIIS {
+		if err := processIISControlsV2(); err != nil {
+			log.Error().Err(err).Msg("error in processIISControlsV2")
+		}
 	}
 }
 
@@ -9993,7 +10331,8 @@ func getStartupCommands2() (string, error) {
 func getNetworkShares() (string, error) {
 	log.Info().Msg("initiating getting network shares...")
 
-	script := `"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; net share"`
+	netCommandPath := getNetCommandPath()
+	script := fmt.Sprintf(`"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; %s share"`, netCommandPath)
 	output, err := createAndRunBatScriptWithOutput("netshare.bat", powerShellPath+" "+script)
 	if err != nil {
 		return "", fmt.Errorf("error in creating or running netshare.bat: %w", err)
@@ -11246,6 +11585,7 @@ type ApiRealTimeRedisResponse struct {
 	JsonFile           string `json:"jsonfile,omitempty"`
 	Rescan             bool   `json:"rescan"` // Only rescan
 	Recheckin          bool   `json:"recheckin"`
+	IsDeletedIIS       bool   `json:"isDeletedIIS"`
 	Updates            bool   `json:"updates"`
 	Log                bool   `json:"log"` // To update the logs to the server
 	Leader             bool   `json:"leader"`
@@ -11254,6 +11594,8 @@ type ApiRealTimeRedisResponse struct {
 	TypeOfStringBase64 int    `json:"typeofstringBase64"`
 	RefreshSettings    bool   `json:"refreshSettings"`
 	UploadUsers        bool   `json:"uploadUsers"`
+	RecheckinProduct   bool   `json:"recheckinProduct"` // Only recheckin product, eg: Chrome, Firefox, Office.
+	ProductName        string `json:"productName"`      // The name of the product to recheckin, eg: Chrome, Firefox, Office.
 }
 
 func initRedis(iniData ini.IniConfig) *redis.Client {
@@ -11447,10 +11789,25 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 		if err := sendAckToRedisServer(rdb, "recheck_received", nil); err != nil {
 			log.Error().Err(err).Msg("Failed to send recheck_received message to redis server.")
 		}
+		isDeletedIIS = responseBody.IsDeletedIIS
 
 		if SystemHardeningCheck {
 			os.Remove("Hash Files/uploadAuditToprocess.txt")
 			go runRecheckin(rdb)
+		}
+	}
+
+	if responseBody.RecheckinProduct {
+		if err := sendAckToRedisServer(rdb, "recheck_product_received", nil); err != nil {
+			log.Error().Err(err).Msgf("Failed to send recheck_product_received message to redis server for product %s.", responseBody.ProductName)
+		}
+
+		if err := processBenchmarkAndAuditResultForProducts(responseBody.ProductName); err != nil {
+			log.Error().Err(err).Msgf("Failed to process benchmark and audit result for product %s.", responseBody.ProductName)
+		}
+
+		if err := sendAckToRedisServer(rdb, "recheck_product_completed", nil); err != nil {
+			log.Error().Err(err).Msgf("Failed to send recheck_product_completed message to redis server for product %s.", responseBody.ProductName)
 		}
 	}
 
@@ -11811,6 +12168,8 @@ type ApiRealTimeResponse struct {
 	MaximalRescanInterval     int  `json:"maximalRescanInterval"`
 	MinimalMonitoringInterval int  `json:"minimalMonitoringInterval"`
 	MaximalMonitoringInterval int  `json:"maximalMonitoringInterval"`
+
+	IsDeletedIIS bool `json:"isDeletedIIS"`
 }
 
 // sendRealTimeRequest sends a request to the server to retrieve real time
@@ -11843,6 +12202,7 @@ func processRealTimeServerInstructions(responseBody ApiRealTimeResponse, serialN
 	maximalRescanInterval = responseBody.MaximalRescanInterval         // Time in minutes
 	minimalMonitoringInterval = responseBody.MinimalMonitoringInterval // Time in minutes
 	maximalMonitoringInterval = responseBody.MaximalMonitoringInterval // Time in minutes
+	isDeletedIIS = responseBody.IsDeletedIIS
 
 	if responseBody.StopAgent {
 		// Restart the agent
