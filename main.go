@@ -3645,14 +3645,9 @@ func generateIDAndWriteItToIDTxtFile2(baseFileName string) (string, error) {
 	}
 
 	uniqueID, err := getUserIDFromIDTxtFile2(baseFileName)
-	idFileContent := ""
-	if baseFileName == "id" {
-		idFileContent = fmt.Sprintf("%s,,,,,,\nAgent Version: %s\nUUID: %s", uniqueID, AgentVersion, uuid)
-	} else {
-		idFileContent = fmt.Sprintf("%s,,,,,,", uniqueID)
-	}
 	if err == nil {
 		// If the UUID was successfully retrieved from id.txt file, return it.
+		idFileContent := createIDFileContent(uniqueID, uuid, baseFileName)
 		return writeDataToIDTxtFile2(idFileContent, uniqueID, baseFileName)
 	}
 
@@ -3662,7 +3657,16 @@ func generateIDAndWriteItToIDTxtFile2(baseFileName string) (string, error) {
 
 	log.Debug().Msgf("Generated new UUID: %s.", uniqueID)
 
+	idFileContent := createIDFileContent(uniqueID, uuid, baseFileName)
+
 	return writeDataToIDTxtFile2(idFileContent, uniqueID, baseFileName)
+}
+
+func createIDFileContent(uniqueID, uuid, baseFileName string) string {
+	if baseFileName == "id" {
+		return fmt.Sprintf("%s,,,,,,\nAgent Version: %s\nUUID: %s", uniqueID, AgentVersion, uuid)
+	}
+	return fmt.Sprintf("%s,,,,,,", uniqueID)
 }
 
 // generateIDAndWriteItToIDTxtFile either generates a new UUID and writes it to
@@ -7141,14 +7145,7 @@ func runRecheckin(rdb *redis.Client) error {
 		processIISControlsV2()
 	}
 
-	processBenchmarkAndAuditResultForProducts("google_chrome")
-
-	//! If google chrome installed (using the logic in the `check_type` in the json that i got from Moatadil), grab the assets for google chrom from the server get request and then upload them.
-	//! Same goes for edge and apahe tomcat and others.
-
-	// if err := runIISUploadProcess(); err != nil {
-	// 	log.Error().Err(err).Msg("error in callUploadIIS")
-	// }
+	processBenchmarkAndAuditResultForProducts()
 
 	if err := sendAckToRedisServer(rdb, "recheck_completed", nil); err != nil {
 		log.Error().Err(err).Msg("Failed to send recheck_completed message to redis server")
@@ -7156,6 +7153,21 @@ func runRecheckin(rdb *redis.Client) error {
 
 	log.Info().Msg("Successfully ran rechecking.")
 	return nil
+}
+
+func processBenchmarkAndAuditResultForProducts() {
+	productsArray := []string{
+		"google_chrome",
+		"microsoft_edge",
+		"office_2016",
+	}
+
+	for _, product := range productsArray {
+		if err := processBenchmarkAndAuditResultForSingleProduct(product); err != nil {
+			log.Error().Err(err).Msgf("Failed to process benchmark and audit result for product %s.", product)
+		}
+	}
+
 }
 
 func processIISControlsV2() error {
@@ -7361,8 +7373,8 @@ func processBenchmarkAndAuditResultV2() (bool, error) {
 // processBenchmarkAndAuditResultV2 processes the benchmark and audit result and uploads it to the server
 // If the returned boolean is true, it means that the benchmark is old and no controls were found.
 // That means we need to use the old functions to get the audit result.
-func processBenchmarkAndAuditResultForProducts(productName string) error {
-	log.Info().Msg("Starting to process benchmark and audit result for products.")
+func processBenchmarkAndAuditResultForSingleProduct(productName string) error {
+	log.Info().Msgf("Starting to process benchmark and audit result for product: %s.", productName)
 
 	if err := checkIfProductInstalled(productName); err != nil {
 		return err
@@ -7375,13 +7387,12 @@ func processBenchmarkAndAuditResultForProducts(productName string) error {
 		return fmt.Errorf("failed to generate product ID: %w", err)
 	}
 
-	jsonPayload1 := map[string]interface{}{
+	productDetails := map[string]interface{}{
 		"productID":   productID,
 		"productName": productName,
 	}
 
-	// jsonify the jsonPayload:
-	jsonPayload, err := json.Marshal(jsonPayload1)
+	jsonPayload, err := json.Marshal(productDetails)
 	if err != nil {
 		return fmt.Errorf("failed to marshal jsonPayload: %w", err)
 	}
@@ -7429,7 +7440,7 @@ func processBenchmarkAndAuditResultForProducts(productName string) error {
 
 	exitCommandCheck = true
 
-	log.Info().Msg("Successfully processed benchmark and audit result for products")
+	log.Info().Msgf("Successfully processed benchmark and audit result for product: %s.", productName)
 	return nil
 }
 
@@ -7474,8 +7485,7 @@ func checkIfChromeInstalled() error {
 
 func checkIfEdgeInstalled() error {
 	ps1Script := `Get-AppxPackage -Name Microsoft.MicrosoftEdge | Select 'Name' | Format-List`
-	ps1Path := filepath.Join(CymetricxPath, "checkEdge.ps1")
-	output, err := createAndRunPS1FileWithOutput(ps1Path, ps1Script)
+	output, err := createAndRunPS1FileWithOutput("checkEdge.ps1", ps1Script)
 	if err != nil {
 		return fmt.Errorf("failed to check if Microsoft Edge is installed: %w", err)
 	}
@@ -7489,13 +7499,21 @@ func checkIfEdgeInstalled() error {
 
 func checkIfOffice2016Installed() error {
 	ps1Script := `$(Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* | Select-Object DisplayName) + $(Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Select-Object DisplayName)`
-	ps1Path := filepath.Join(CymetricxPath, "checkOffice2016.ps1")
-	output, err := createAndRunPS1FileWithOutput(ps1Path, ps1Script)
+	output, err := execCommandWithOutput(powerShellPath, ps1Script)
 	if err != nil {
-		return fmt.Errorf("failed to check if Office 2016 is installed: %w", err)
+		return fmt.Errorf("failed to run powershell script to check if Office 2016 is installed: %w", err)
 	}
 
-	if strings.Contains(string(output), "2016") {
+	// Create a regex to look for Microsoft Office *2016*
+	// This is because the DisplayName might contain other versions of Microsoft Office
+	// e.g., Microsoft Office 2016, Microsoft Office 2016 Pro, etc.
+	regexPattern := `Microsoft Office.*2016.*`
+	matched, err := regexp.MatchString(regexPattern, string(output))
+	if err != nil {
+		return fmt.Errorf("failed to match regex pattern: %w", err)
+	}
+
+	if matched {
 		return nil
 	}
 
@@ -9614,6 +9632,8 @@ func handleBenchmarkAndAuditResult() {
 			log.Error().Err(err).Msg("error in processIISControlsV2")
 		}
 	}
+
+	processBenchmarkAndAuditResultForProducts()
 }
 
 type UploadTask struct {
@@ -11802,7 +11822,7 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 			log.Error().Err(err).Msgf("Failed to send recheck_product_received message to redis server for product %s.", responseBody.ProductName)
 		}
 
-		if err := processBenchmarkAndAuditResultForProducts(responseBody.ProductName); err != nil {
+		if err := processBenchmarkAndAuditResultForSingleProduct(responseBody.ProductName); err != nil {
 			log.Error().Err(err).Msgf("Failed to process benchmark and audit result for product %s.", responseBody.ProductName)
 		}
 
