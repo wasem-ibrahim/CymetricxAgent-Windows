@@ -7380,7 +7380,6 @@ func processBenchmarkAndAuditResultForSingleProduct(productName string) error {
 		return err
 	}
 
-	fmt.Println("Product Name: ", productName)
 	// productID, err := generateProductIDAndWriteItToProductTxtFile(productName)
 	productID, err := generateIDAndWriteItToIDTxtFile2(productName)
 	if err != nil {
@@ -7396,8 +7395,6 @@ func processBenchmarkAndAuditResultForSingleProduct(productName string) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal jsonPayload: %w", err)
 	}
-
-	fmt.Println("JSON Payload: ", string(jsonPayload))
 
 	productResponseBody, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", "upload_product/"+id, jsonPayload, 10)
 	if err != nil {
@@ -7485,9 +7482,9 @@ func checkIfChromeInstalled() error {
 
 func checkIfEdgeInstalled() error {
 	ps1Script := `Get-AppxPackage -Name Microsoft.MicrosoftEdge | Select 'Name' | Format-List`
-	output, err := createAndRunPS1FileWithOutput("checkEdge.ps1", ps1Script)
+	output, err := execCommandWithOutput(powerShellPath, ps1Script)
 	if err != nil {
-		return fmt.Errorf("failed to check if Microsoft Edge is installed: %w", err)
+		return fmt.Errorf("failed to run powershell script to check if Office 2016 is installed: %w", err)
 	}
 
 	if strings.Contains(string(output), "Name : Microsoft.MicrosoftEdge") || fileExists(`%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe`) {
@@ -13155,7 +13152,6 @@ func processControls(controls []map[string]interface{}, handlers map[string]func
 
 			conditionControlMap["item_type"] = "condition"
 			conditionControlMap["item"] = control["item"]
-			// combinedList = append(combinedList, conditionControlMap)
 			// add controlResultMap to be a value to a key "control_result"
 			var controlResultMap = map[string]interface{}{
 				"control_result": controlResultList,
@@ -13190,18 +13186,7 @@ func processControls(controls []map[string]interface{}, handlers map[string]func
 		}
 	}
 
-	// turn the list of maps into a JSON string
-	// jsonData, err := json.MarshalIndent(combinedList, "", "  ")
-	// jsonData, err := json.Marshal(combinedList)
-	// if err != nil {
-	// 	log.Error().Err(err).Msg("Error marshalling JSON data for processing controls")
-	// }
-
-	// return jsonData
-
 	return combinedList
-
-	// fmt.Println(string(jsonData))
 }
 func processItem(control map[string]interface{}, status string) []map[string]string {
 	var itemMaps []map[string]string
@@ -13459,6 +13444,12 @@ func processIfBlock(ifBlock map[string]interface{}, variables map[string]string,
 func processSingleControl(control map[string]string, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error)) map[string]string {
 	if objType, ok := control["type"]; ok {
 		if handler, exists := handlers[objType]; exists {
+			controlKey, ok := control["control_key"]
+			if !ok {
+				controlKey = ""
+			}
+			log.Debug().Msgf("Starting to process control with key %s and type %s", controlKey, objType)
+
 			returnedMap, err := handler(control, variables)
 			if err != nil {
 				returnedMap["Exception"] = err.Error()
@@ -13469,7 +13460,6 @@ func processSingleControl(control map[string]string, variables map[string]string
 			returnedMap["automated"] = "true"
 			return returnedMap
 		} else {
-			// fmt.Println("No handler for type:", objType)
 			log.Warn().Msg("No handler for type: " + objType)
 			return map[string]string{
 				"automated":   "false",
