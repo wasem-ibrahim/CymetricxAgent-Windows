@@ -3633,7 +3633,7 @@ func generateIDAndWriteItToIDTxtFile() (string, error) {
 }
 
 func generateIDAndWriteItToIDTxtFile2(baseFileName string) (string, error) {
-	log.Info().Msg("Attempting to retrieve user ID from id.txt file.")
+	log.Info().Msgf("Attempting to retrieve user ID from %s.txt file.", baseFileName)
 
 	uuid := ""
 	if baseFileName == "id" {
@@ -3642,6 +3642,9 @@ func generateIDAndWriteItToIDTxtFile2(baseFileName string) (string, error) {
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to get UUID from Windows.")
 		}
+	} else {
+		// Add _id to the baseFileName to differentiate it from the other product ID files.
+		baseFileName = baseFileName + "_id"
 	}
 
 	uniqueID, err := getUserIDFromIDTxtFile2(baseFileName)
@@ -3651,15 +3654,43 @@ func generateIDAndWriteItToIDTxtFile2(baseFileName string) (string, error) {
 		return writeDataToIDTxtFile2(idFileContent, uniqueID, baseFileName)
 	}
 
-	log.Warn().Err(err).Msg("Failed to retrieve user ID from id.txt, generating a new UUID.")
+	log.Warn().Err(err).Msgf("Failed to retrieve user ID from %s.txt, generating a new UUID.", baseFileName)
 
 	uniqueID = generateUUID()
 
 	log.Debug().Msgf("Generated new UUID: %s.", uniqueID)
 
+	// Deleting other product ID files so they are always unique if the ID was removed before:
+	if baseFileName == "id" {
+		if err := removeOtherProductIDFiles(); err != nil {
+			return "", err
+		}
+	}
+
 	idFileContent := createIDFileContent(uniqueID, uuid, baseFileName)
 
 	return writeDataToIDTxtFile2(idFileContent, uniqueID, baseFileName)
+}
+
+func removeOtherProductIDFiles() error {
+	productsArray := []string{
+		"google_chrome",
+		"microsoft_edge",
+		"office_2016",
+	}
+
+	for _, product := range productsArray {
+		filePath := filepath.Join(CymetricxPath, fmt.Sprintf("%s_id.txt", product))
+		if !fileExists(filePath) {
+			continue
+		}
+
+		if err := os.Remove(filePath); err != nil {
+			return fmt.Errorf("failed to remove %s file: %w", filePath, err)
+		}
+	}
+
+	return nil
 }
 
 func createIDFileContent(uniqueID, uuid, baseFileName string) string {
@@ -3915,7 +3946,7 @@ func writeDataToIDTxtFile2(idFileContent, uniqueID, baseFileName string) (string
 		return "", fmt.Errorf("error writing the new UUID to id.txt file. %w", err)
 	}
 
-	log.Info().Msgf("Successfully wrote data to id.txt file")
+	log.Info().Msgf("Successfully wrote data to %s file", idFilePath)
 	return uniqueID, nil
 }
 
@@ -7167,7 +7198,6 @@ func processBenchmarkAndAuditResultForProducts() {
 			log.Error().Err(err).Msgf("Failed to process benchmark and audit result for product %s.", product)
 		}
 	}
-
 }
 
 func processIISControlsV2() error {
