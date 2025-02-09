@@ -10,7 +10,7 @@ func main3() {
 	jsonData := getJSONData()
 
 	// Process the JSON data
-	jsonDataOutput := processControlsData(jsonData)
+	jsonDataOutput := processControlsData(jsonData, "System Controls")
 
 	// Export it to a file
 	// err := os.WriteFile("output.json", jsonDataOutput, 0644)

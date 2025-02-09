@@ -7144,6 +7144,8 @@ func runRecheckin(rdb *redis.Client) error {
 		return nil
 	}
 
+	go processBenchmarkAndAuditResultForProducts()
+
 	ifOldBenchmark, err := processBenchmarkAndAuditResultV2()
 	if err != nil {
 		log.Error().Err(err).Msg("error in processBenchmarkAndAuditResultV2")
@@ -7176,8 +7178,6 @@ func runRecheckin(rdb *redis.Client) error {
 		processIISControlsV2()
 	}
 
-	processBenchmarkAndAuditResultForProducts()
-
 	if err := sendAckToRedisServer(rdb, "recheck_completed", nil); err != nil {
 		log.Error().Err(err).Msg("Failed to send recheck_completed message to redis server")
 	}
@@ -7187,6 +7187,8 @@ func runRecheckin(rdb *redis.Client) error {
 }
 
 func processBenchmarkAndAuditResultForProducts() {
+	defer catchPanic()
+
 	productsArray := []string{
 		"google_chrome",
 		"microsoft_edge",
@@ -7267,7 +7269,7 @@ func processIISControlsV2() error {
 
 	// Write response body to a file
 
-	jsonDataOutput := processControlsData(responseBodyStr)
+	jsonDataOutput := processControlsData(responseBodyStr, "IIS")
 	// jsonDataOutputString := string(jsonDataOutput)
 
 	endPoint = "audit-result/" + iisID
@@ -7363,6 +7365,9 @@ func processBenchmarkAndAuditResultV2() (bool, error) {
 		return false, fmt.Errorf("failed to get asset controls: %w", err)
 	}
 
+	controlsInputPath := filepath.Join(CymetricxPath, "controls-input.json")
+	os.WriteFile(controlsInputPath, responseBody.Bytes(), 0644)
+
 	responseBodyStr := responseBody.String()
 	if responseBodyStr == "" {
 		log.Info().Msg("No asset controls to recheck.")
@@ -7384,8 +7389,10 @@ func processBenchmarkAndAuditResultV2() (bool, error) {
 		return true, nil
 	}
 
-	jsonDataOutput := processControlsData(responseBodyStr)
-	// jsonDataOutputString := string(jsonDataOutput)
+	jsonDataOutput := processControlsData(responseBodyStr, "System Controls")
+
+	controlsOutputPath := filepath.Join(CymetricxPath, "controls-output.json")
+	os.WriteFile(controlsOutputPath, jsonDataOutput, 0644)
 
 	endPoint = "audit-result/" + id
 	_, err = prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", endPoint, jsonDataOutput, 10)
@@ -7456,7 +7463,7 @@ func processBenchmarkAndAuditResultForSingleProduct(productName string) error {
 		return fmt.Errorf("failed to unmarshal response body for products: %w", err)
 	}
 
-	jsonDataOutput := processControlsData(responseBodyStr)
+	jsonDataOutput := processControlsData(responseBodyStr, productName)
 
 	endPoint = "audit-products-result/" + productID
 	_, err = prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", endPoint, jsonDataOutput, 10)
@@ -7676,6 +7683,8 @@ func getBenchMark() (string, error) {
 }
 
 func uploadIIS(iisData string) {
+	defer catchPanic()
+
 	log.Info().Msg("Starting upload IIS...")
 
 	jsonPayload, err := processIISDataAndTurnIntoJson(iisData)
@@ -9650,6 +9659,8 @@ func handleBenchmarkAndAuditResult() {
 		log.Error().Err(err).Msg("error in processBenchmarkAndAuditResultV2")
 	}
 
+	go processBenchmarkAndAuditResultForProducts()
+
 	if ifOldBenchmark {
 		processBenchmarkAndAuditResult()
 	}
@@ -9660,7 +9671,6 @@ func handleBenchmarkAndAuditResult() {
 		}
 	}
 
-	processBenchmarkAndAuditResultForProducts()
 }
 
 type UploadTask struct {
@@ -13014,7 +13024,7 @@ func convertControls(controls []interface{}) []map[string]interface{} {
 }
 
 // Process a single condition object
-func processCondition(condition map[string]interface{}, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), controlResultList *[]interface{}, automatedValue *string) (map[string]interface{}, string, bool) {
+func processCondition(condition map[string]interface{}, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), controlResultList *[]interface{}, automatedValue *string, benchmarkType string) (map[string]interface{}, string, bool) {
 	attributes := condition["@attributes"].(map[string]interface{})
 
 	var auto string
@@ -13052,7 +13062,7 @@ func processCondition(condition map[string]interface{}, variables map[string]str
 				convertedItem[k] = strVal
 			}
 		}
-		returnedMap := processSingleControl(convertedItem, variables, handlers)
+		returnedMap := processSingleControl(convertedItem, variables, handlers, benchmarkType)
 
 		// if control has a control_key, it is a control and will be shown as passed or failed
 		re := regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`)
@@ -13124,7 +13134,7 @@ func checkIfReturnedMapIsControl(control map[string]string, controlResultList []
 
 // Process controls using the handlers
 // func processControls(controls []map[string]interface{}, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), variables map[string]string) []byte {
-func processControls(controls []map[string]interface{}, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), variables map[string]string) []interface{} {
+func processControls(controls []map[string]interface{}, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), variables map[string]string, benchmarkType string) []interface{} {
 	var combinedList []interface{}
 	for _, control := range controls {
 		var controlResultList []interface{}
@@ -13134,11 +13144,11 @@ func processControls(controls []map[string]interface{}, handlers map[string]func
 
 			// Process the condition block
 			condition := control["condition"].(map[string]interface{})
-			condtionKeyMap, autoKeyValue, ifPassed := processCondition(condition, variables, handlers, &controlResultList, &automatedValue)
+			condtionKeyMap, autoKeyValue, ifPassed := processCondition(condition, variables, handlers, &controlResultList, &automatedValue, benchmarkType)
 			conditionControlMap["condition"] = condtionKeyMap
 
 			if ifPassed {
-				thenMapList, ifReport := processThen(control["then"].(map[string]interface{}), variables, handlers, &controlResultList, true, &automatedValue, autoKeyValue)
+				thenMapList, ifReport := processThen(control["then"].(map[string]interface{}), variables, handlers, &controlResultList, true, &automatedValue, autoKeyValue, benchmarkType)
 				conditionControlMap["then"] = thenMapList
 				if ifReport {
 					// read the item block and return it with status true
@@ -13150,7 +13160,7 @@ func processControls(controls []map[string]interface{}, handlers map[string]func
 				}
 			} else if elseControl, ok := control["else"]; ok {
 				// else block has the same logic as the "then" block
-				thenMapList, ifReport := processThen(elseControl.(map[string]interface{}), variables, handlers, &controlResultList, false, &automatedValue, autoKeyValue)
+				thenMapList, ifReport := processThen(elseControl.(map[string]interface{}), variables, handlers, &controlResultList, false, &automatedValue, autoKeyValue, benchmarkType)
 				if ifReport {
 					// read the item block and return it with status true
 					// The control passed
@@ -13162,7 +13172,7 @@ func processControls(controls []map[string]interface{}, handlers map[string]func
 			} else if !ifPassed {
 				// if no else, then go back to then and you'll find the report block which you give false status
 				if _, ok := control["then"]; ok {
-					thenMapList, ifReport := processThen(control["then"].(map[string]interface{}), variables, handlers, &controlResultList, false, &automatedValue, autoKeyValue)
+					thenMapList, ifReport := processThen(control["then"].(map[string]interface{}), variables, handlers, &controlResultList, false, &automatedValue, autoKeyValue, benchmarkType)
 					conditionControlMap["then"] = thenMapList
 					if ifReport {
 						// read the item block and return it with status true
@@ -13204,7 +13214,7 @@ func processControls(controls []map[string]interface{}, handlers map[string]func
 					strMap[key] = strVal
 				}
 			}
-			returnedMap := processSingleControl(strMap, variables, handlers)
+			returnedMap := processSingleControl(strMap, variables, handlers, benchmarkType)
 			if returnedMap != nil {
 				returnedMaps = append(returnedMaps, returnedMap)
 			}
@@ -13251,7 +13261,7 @@ func processItem(control map[string]interface{}, status string) []map[string]str
 
 // Process "then" block
 // Return true if report is seen. False otherwise
-func processThen(thenBlock map[string]interface{}, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), controlResultList *[]interface{}, passed bool, automatedValue *string, autoKeyValue string) (map[string]interface{}, bool) {
+func processThen(thenBlock map[string]interface{}, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), controlResultList *[]interface{}, passed bool, automatedValue *string, autoKeyValue string, benchmarkType string) (map[string]interface{}, bool) {
 	// Check if "report" block exists
 	if report, ok := thenBlock["report"]; ok {
 		reportBlock := map[string]interface{}{
@@ -13382,7 +13392,7 @@ func processThen(thenBlock map[string]interface{}, variables map[string]string, 
 					convertedItem[k] = strVal
 				}
 			}
-			returnedMap := processSingleControl(convertedItem, variables, handlers)
+			returnedMap := processSingleControl(convertedItem, variables, handlers, benchmarkType)
 			// if control has a control_key, it is a control and will be shown as passed or failed
 			// Regular expression to match the desired format
 
@@ -13407,7 +13417,7 @@ func processThen(thenBlock map[string]interface{}, variables map[string]string, 
 
 	// Check if "if" block exists and process it
 	if ifBlock, ok := thenBlock["if"]; ok {
-		ifBlockResult, ifReport := processIfBlock(ifBlock.(map[string]interface{}), variables, handlers, controlResultList, automatedValue)
+		ifBlockResult, ifReport := processIfBlock(ifBlock.(map[string]interface{}), variables, handlers, controlResultList, automatedValue, benchmarkType)
 		thenBlock["if"] = ifBlockResult
 		return thenBlock, ifReport
 	}
@@ -13418,21 +13428,21 @@ func processThen(thenBlock map[string]interface{}, variables map[string]string, 
 
 // Process "if" block
 // Process "if" block
-func processIfBlock(ifBlock map[string]interface{}, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), controlResultList *[]interface{}, automatedValue *string) (map[string]interface{}, bool) {
+func processIfBlock(ifBlock map[string]interface{}, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), controlResultList *[]interface{}, automatedValue *string, benchmarkType string) (map[string]interface{}, bool) {
 	condition := ifBlock["condition"].(map[string]interface{})
-	conditionResult, autoKeyValue, pass := processCondition(condition, variables, handlers, controlResultList, automatedValue)
+	conditionResult, autoKeyValue, pass := processCondition(condition, variables, handlers, controlResultList, automatedValue, benchmarkType)
 	ifBlock["condition"] = conditionResult
 	if pass {
-		thenBlockResult, thenReport := processThen(ifBlock["then"].(map[string]interface{}), variables, handlers, controlResultList, true, automatedValue, autoKeyValue)
+		thenBlockResult, thenReport := processThen(ifBlock["then"].(map[string]interface{}), variables, handlers, controlResultList, true, automatedValue, autoKeyValue, benchmarkType)
 		ifBlock["then"] = thenBlockResult
 		return ifBlock, thenReport
 	} else if elseBlock, ok := ifBlock["else"]; ok {
-		elseBlockResult, elseReport := processThen(elseBlock.(map[string]interface{}), variables, handlers, controlResultList, false, automatedValue, autoKeyValue)
+		elseBlockResult, elseReport := processThen(elseBlock.(map[string]interface{}), variables, handlers, controlResultList, false, automatedValue, autoKeyValue, benchmarkType)
 		ifBlock["else"] = elseBlockResult
 		return ifBlock, elseReport
 	} else if !pass {
 		if _, ok := ifBlock["then"]; ok {
-			thenBlockResult, thenReport := processThen(ifBlock["then"].(map[string]interface{}), variables, handlers, controlResultList, false, automatedValue, autoKeyValue)
+			thenBlockResult, thenReport := processThen(ifBlock["then"].(map[string]interface{}), variables, handlers, controlResultList, false, automatedValue, autoKeyValue, benchmarkType)
 			ifBlock["then"] = thenBlockResult
 			return ifBlock, thenReport
 		}
@@ -13471,14 +13481,14 @@ func processIfBlock(ifBlock map[string]interface{}, variables map[string]string,
 */
 
 // Process a single control using handlers
-func processSingleControl(control map[string]string, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error)) map[string]string {
+func processSingleControl(control map[string]string, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), benchmarkType string) map[string]string {
 	if objType, ok := control["type"]; ok {
 		if handler, exists := handlers[objType]; exists {
 			controlKey, ok := control["control_key"]
 			if !ok {
 				controlKey = ""
 			}
-			log.Debug().Msgf("Starting to process control with key %s and type %s", controlKey, objType)
+			log.Debug().Msgf("Starting to process control for %s with key %s and type %s", benchmarkType, controlKey, objType)
 
 			returnedMap, err := handler(control, variables)
 			if err != nil {
@@ -13508,7 +13518,7 @@ func processSingleControl(control map[string]string, variables map[string]string
 }
 
 // Function to process the JSON data
-func processControlsData(jsonData string) []byte {
+func processControlsData(jsonData, benchmarkType string) []byte {
 	// Unmarshal the JSON into a slice of maps
 	var levels []map[string]interface{}
 	err := json.Unmarshal([]byte(jsonData), &levels)
@@ -13549,7 +13559,7 @@ func processControlsData(jsonData string) []byte {
 		// Convert and process controls
 		if controls, ok := level["controls"].([]interface{}); ok {
 			convertedControls := convertControls(controls)
-			jsonDataOutput := processControls(convertedControls, handlers, variables)
+			jsonDataOutput := processControls(convertedControls, handlers, variables, benchmarkType)
 			jsonDataOutputCombined = append(jsonDataOutputCombined, jsonDataOutput...)
 			// return jsonDataOutput
 		} else {
