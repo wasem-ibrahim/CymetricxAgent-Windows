@@ -3685,6 +3685,8 @@ func removeOtherProductIDFiles() error {
 			continue
 		}
 
+		log.Debug().Msgf("Removing product ID file: %s", filePath)
+
 		if err := os.Remove(filePath); err != nil {
 			return fmt.Errorf("failed to remove %s file: %w", filePath, err)
 		}
@@ -7178,7 +7180,7 @@ func runRecheckin(rdb *redis.Client) error {
 		processIISControlsV2()
 	}
 
-	if err := sendAckToRedisServer(rdb, "recheck_completed", nil); err != nil {
+	if err := sendAckToRedisServer(rdb, "recheck_completed", nil, nil); err != nil {
 		log.Error().Err(err).Msg("Failed to send recheck_completed message to redis server")
 	}
 
@@ -7195,9 +7197,15 @@ func processBenchmarkAndAuditResultForProducts() {
 		"office_2016",
 	}
 
-	for _, product := range productsArray {
-		if err := processBenchmarkAndAuditResultForSingleProduct(product); err != nil {
-			log.Error().Err(err).Msgf("Failed to process benchmark and audit result for product %s.", product)
+	for _, productName := range productsArray {
+		productID, err := checkAndGenerateProductID(productName)
+		if err != nil {
+			log.Error().Err(err).Msgf("Failed to check and generate product ID for product %s.", productName)
+			continue
+		}
+
+		if err := processBenchmarkAndAuditResultForSingleProduct(productName, productID); err != nil {
+			log.Error().Err(err).Msgf("Failed to process benchmark and audit result for product %s.", productName)
 		}
 	}
 }
@@ -7407,21 +7415,24 @@ func processBenchmarkAndAuditResultV2() (bool, error) {
 	return false, nil
 }
 
+func checkAndGenerateProductID(productName string) (string, error) {
+	if err := checkIfProductInstalled(productName); err != nil {
+		return "", err
+	}
+
+	productID, err := generateIDAndWriteItToIDTxtFile2(productName)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate product ID: %w", err)
+	}
+
+	return productID, nil
+}
+
 // processBenchmarkAndAuditResultV2 processes the benchmark and audit result and uploads it to the server
 // If the returned boolean is true, it means that the benchmark is old and no controls were found.
 // That means we need to use the old functions to get the audit result.
-func processBenchmarkAndAuditResultForSingleProduct(productName string) error {
+func processBenchmarkAndAuditResultForSingleProduct(productName, productID string) error {
 	log.Info().Msgf("Starting to process benchmark and audit result for product: %s.", productName)
-
-	if err := checkIfProductInstalled(productName); err != nil {
-		return err
-	}
-
-	// productID, err := generateProductIDAndWriteItToProductTxtFile(productName)
-	productID, err := generateIDAndWriteItToIDTxtFile2(productName)
-	if err != nil {
-		return fmt.Errorf("failed to generate product ID: %w", err)
-	}
 
 	productDetails := map[string]interface{}{
 		"productID":   productID,
@@ -7850,7 +7861,7 @@ func rescanAndCompressAndUploadEverthing(rdb *redis.Client) error {
 
 	rescanStatus = false
 
-	if err := sendAckToRedisServer(rdb, "rescan_completed", nil); err != nil {
+	if err := sendAckToRedisServer(rdb, "rescan_completed", nil, nil); err != nil {
 		log.Error().Err(err).Msg("Failed to send rescan_completed message to redis server")
 	}
 
@@ -11758,9 +11769,14 @@ type RedisReplyMessage struct {
 	CommandID *int   `json:"command_id,omitempty"`
 }
 
-func sendAckToRedisServer(rdb *redis.Client, msgContent string, commandID *int) error {
+func sendAckToRedisServer(rdb *redis.Client, msgContent string, commandID *int, productID *string) error {
+	clientID := id
+	if productID != nil {
+		clientID = *productID
+	}
+
 	redisReplyMessage := RedisReplyMessage{
-		ClientID:  id,
+		ClientID:  clientID,
 		Content:   msgContent,
 		CommandID: commandID,
 	}
@@ -11820,7 +11836,7 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 	}
 
 	if responseBody.Commands != "" {
-		if err := sendAckToRedisServer(rdb, "command_received", &responseBody.IDCommands); err != nil {
+		if err := sendAckToRedisServer(rdb, "command_received", &responseBody.IDCommands, nil); err != nil {
 			log.Error().Err(err).Msg("Failed to send command_received message to redis server.")
 		}
 
@@ -11843,7 +11859,7 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 	}
 
 	if responseBody.Recheckin {
-		if err := sendAckToRedisServer(rdb, "recheck_received", nil); err != nil {
+		if err := sendAckToRedisServer(rdb, "recheck_received", nil, nil); err != nil {
 			log.Error().Err(err).Msg("Failed to send recheck_received message to redis server.")
 		}
 		isDeletedIIS = responseBody.IsDeletedIIS
@@ -11855,15 +11871,22 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 	}
 
 	if responseBody.RecheckinProduct {
-		if err := sendAckToRedisServer(rdb, "recheck_product_received", nil); err != nil {
+		productID, err := checkAndGenerateProductID(responseBody.ProductName)
+		if err != nil {
+			log.Error().Err(err).Msgf("Failed to check and generate product ID for product %s.", responseBody.ProductName)
+			return
+		}
+
+		if err := sendAckToRedisServer(rdb, "recheck_product_received", nil, &productID); err != nil {
 			log.Error().Err(err).Msgf("Failed to send recheck_product_received message to redis server for product %s.", responseBody.ProductName)
 		}
 
-		if err := processBenchmarkAndAuditResultForSingleProduct(responseBody.ProductName); err != nil {
+		if err := processBenchmarkAndAuditResultForSingleProduct(responseBody.ProductName, productID); err != nil {
 			log.Error().Err(err).Msgf("Failed to process benchmark and audit result for product %s.", responseBody.ProductName)
+			return
 		}
 
-		if err := sendAckToRedisServer(rdb, "recheck_product_completed", nil); err != nil {
+		if err := sendAckToRedisServer(rdb, "recheck_product_completed", nil, &productID); err != nil {
 			log.Error().Err(err).Msgf("Failed to send recheck_product_completed message to redis server for product %s.", responseBody.ProductName)
 		}
 	}
@@ -11871,7 +11894,7 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 	// Only rescan
 	if responseBody.Rescan {
 		activeDirectoryDomainController = responseBody.Leader
-		if err := sendAckToRedisServer(rdb, "rescan_received", nil); err != nil {
+		if err := sendAckToRedisServer(rdb, "rescan_received", nil, nil); err != nil {
 			log.Error().Err(err).Msg("Failed to send rescan_received message to redis server.")
 		}
 
@@ -11879,7 +11902,7 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 	}
 
 	if responseBody.Updates {
-		if err := sendAckToRedisServer(rdb, "update_received", nil); err != nil {
+		if err := sendAckToRedisServer(rdb, "update_received", nil, nil); err != nil {
 			log.Error().Err(err).Msg("Failed to send update_received message to redis server.")
 		}
 
@@ -11889,7 +11912,7 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 	}
 
 	if responseBody.Log {
-		if err := sendAckToRedisServer(rdb, "logs_received", nil); err != nil {
+		if err := sendAckToRedisServer(rdb, "logs_received", nil, nil); err != nil {
 			log.Error().Err(err).Msg("Failed to send logs_received message to redis server.")
 		}
 
@@ -11898,7 +11921,7 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 		}
 
 		// Only send ack to the server if the logs are uploaded when request is done through redis.
-		if err := sendAckToRedisServer(rdb, "logs_completed", nil); err != nil {
+		if err := sendAckToRedisServer(rdb, "logs_completed", nil, nil); err != nil {
 			log.Error().Err(err).Msg("Failed to send logs_completed message to redis server")
 		}
 	}
