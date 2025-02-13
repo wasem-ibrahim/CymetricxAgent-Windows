@@ -7198,13 +7198,13 @@ func processBenchmarkAndAuditResultForProducts() {
 	}
 
 	for _, productName := range productsArray {
-		productID, err := checkAndGenerateProductID(productName)
+		productID, productVersion, err := checkAndGenerateProductID(productName)
 		if err != nil {
 			log.Error().Err(err).Msgf("Failed to check and generate product ID for product %s.", productName)
 			continue
 		}
 
-		if err := processBenchmarkAndAuditResultForSingleProduct(productName, productID); err != nil {
+		if err := processBenchmarkAndAuditResultForSingleProduct(productName, productID, productVersion); err != nil {
 			log.Error().Err(err).Msgf("Failed to process benchmark and audit result for product %s.", productName)
 		}
 	}
@@ -7451,34 +7451,38 @@ func processBenchmarkAndAuditResultV2() (bool, error) {
 	return false, nil
 }
 
-func checkAndGenerateProductID(productName string) (string, error) {
-	if err := checkIfProductInstalled(productName); err != nil {
-		return "", err
+func checkAndGenerateProductID(productName string) (string, string, error) {
+	productVersion, err := checkIfProductInstalled(productName)
+	if err != nil {
+		return "", "", err
 	}
 
 	productID, err := generateIDAndWriteItToIDTxtFile2(productName)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate product ID: %w", err)
+		return "", "", fmt.Errorf("failed to generate product ID: %w", err)
 	}
 
-	return productID, nil
+	return productID, productVersion, nil
 }
 
 // processBenchmarkAndAuditResultV2 processes the benchmark and audit result and uploads it to the server
 // If the returned boolean is true, it means that the benchmark is old and no controls were found.
 // That means we need to use the old functions to get the audit result.
-func processBenchmarkAndAuditResultForSingleProduct(productName, productID string) error {
+func processBenchmarkAndAuditResultForSingleProduct(productName, productID, productVersion string) error {
 	log.Info().Msgf("Starting to process benchmark and audit result for product: %s.", productName)
 
 	productDetails := map[string]interface{}{
-		"productID":   productID,
-		"productName": productName,
+		"productID":      productID,
+		"productName":    productName,
+		"productVersion": productVersion,
 	}
 
 	jsonPayload, err := json.Marshal(productDetails)
 	if err != nil {
 		return fmt.Errorf("failed to marshal jsonPayload: %w", err)
 	}
+
+	fmt.Println("Product Details: ", string(jsonPayload))
 
 	productResponseBody, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", "upload_product/"+id, jsonPayload, 10)
 	if err != nil {
@@ -7525,25 +7529,96 @@ func processBenchmarkAndAuditResultForSingleProduct(productName, productID strin
 	return nil
 }
 
-func checkIfProductInstalled(productName string) error {
-	var productCheckers = map[string]func() error{
-		"google_chrome":  checkIfChromeInstalled,
-		"microsoft_edge": checkIfEdgeInstalled,
-		"office_2016":    checkIfOffice2016Installed,
+func checkIfProductInstalled(productName string) (string, error) {
+	var productCheckers = map[string]func() (string, error){
+		"google_chrome":  checkIfChromeInstalledAndGetItsVersion,
+		"microsoft_edge": checkIfEdgeInstalledAndGetItsVersion,
+		"office_2016":    checkIfOffice2016InstalledAndGetItsVersion,
 	}
 
 	log.Info().Msgf("Checking if %s is installed.", productName)
 
 	checker, exists := productCheckers[productName]
 	if !exists {
-		return fmt.Errorf("failed to check if %s is installed", productName)
-	}
-	if err := checker(); err != nil {
-		return fmt.Errorf("failed to check if %s is installed: %w", productName, err)
+		return "", fmt.Errorf("failed to check if %s is installed", productName)
 	}
 
-	log.Info().Msgf("%s is installed.", productName)
-	return nil
+	productVersion, err := checker()
+	if err != nil {
+		return "", fmt.Errorf("failed to check if %s is installed: %w", productName, err)
+	}
+
+	log.Info().Msgf("%s is installed with version %s.", productName, productVersion)
+	return productVersion, nil
+}
+
+func checkIfChromeInstalledAndGetItsVersion() (string, error) {
+	if err := checkIfChromeInstalled(); err != nil {
+		return "", err
+	}
+
+	// Get the version of Google Chrome
+	version, err := getChromeVersion()
+	if err != nil {
+		return "", fmt.Errorf("failed to get the version of Google Chrome: %w", err)
+	}
+
+	return version, nil
+}
+
+func getChromeVersion() (string, error) {
+	// Get the version of Google Chrome
+	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Google\Chrome\BLBeacon`, registry.QUERY_VALUE)
+	if err != nil {
+		return "", fmt.Errorf("failed to open registry key: %w", err)
+	}
+	defer key.Close()
+
+	// Read the version value (stored as a string)
+	version, _, err := key.GetStringValue("version")
+	if err != nil {
+		return "", fmt.Errorf("failed to get version value for Google Chrome: %w", err)
+	}
+
+	return version, nil
+}
+
+func checkIfEdgeInstalledAndGetItsVersion() (string, error) {
+	if err := checkIfEdgeInstalled(); err != nil {
+		return "", err
+	}
+
+	// Get the version of Microsoft Edge
+	version, err := getEdgeVersion()
+	if err != nil {
+		return "", fmt.Errorf("failed to get the version of Microsoft Edge: %w", err)
+	}
+
+	return version, nil
+}
+
+func getEdgeVersion() (string, error) {
+	// Get the version of Microsoft Edge
+	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Edge\BLBeacon`, registry.QUERY_VALUE)
+	if err != nil {
+		return "", fmt.Errorf("failed to open registry key: %w", err)
+	}
+
+	// Read the version value (stored as a string)
+	version, _, err := key.GetStringValue("version")
+	if err != nil {
+		return "", fmt.Errorf("failed to get version value for Microsoft Edge: %w", err)
+	}
+
+	return version, nil
+}
+
+func checkIfOffice2016InstalledAndGetItsVersion() (string, error) {
+	if err := checkIfOffice2016Installed(); err != nil {
+		return "", err
+	}
+
+	return "2016", nil
 }
 
 func checkIfChromeInstalled() error {
@@ -11907,7 +11982,7 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 	}
 
 	if responseBody.RecheckinProduct {
-		productID, err := checkAndGenerateProductID(responseBody.ProductName)
+		productID, productVersion, err := checkAndGenerateProductID(responseBody.ProductName)
 		if err != nil {
 			log.Error().Err(err).Msgf("Failed to check and generate product ID for product %s.", responseBody.ProductName)
 			return
@@ -11917,7 +11992,7 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 			log.Error().Err(err).Msgf("Failed to send recheck_product_received message to redis server for product %s.", responseBody.ProductName)
 		}
 
-		if err := processBenchmarkAndAuditResultForSingleProduct(responseBody.ProductName, productID); err != nil {
+		if err := processBenchmarkAndAuditResultForSingleProduct(responseBody.ProductName, productID, productVersion); err != nil {
 			log.Error().Err(err).Msgf("Failed to process benchmark and audit result for product %s.", responseBody.ProductName)
 			return
 		}
