@@ -7482,8 +7482,6 @@ func processBenchmarkAndAuditResultForSingleProduct(productName, productID, prod
 		return fmt.Errorf("failed to marshal jsonPayload: %w", err)
 	}
 
-	fmt.Println("Product Details: ", string(jsonPayload))
-
 	productResponseBody, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", "upload_product/"+id, jsonPayload, 10)
 	if err != nil {
 		log.Error().Err(err).Msg("Error while executing upload request for IIS.")
@@ -9722,8 +9720,6 @@ func audit_result(command string, ifCallLaravel bool) (string, error) {
 func startInitialFullSystemDataAndDetailsScan() {
 	log.Info().Msg("Starting the process of initial full scanning system data and details ... ")
 
-	handleBenchmarkAndAuditResult()
-
 	tasks := []*UploadTask{
 		{
 			File: "system-details-timer.txt",
@@ -9771,6 +9767,8 @@ func startInitialFullSystemDataAndDetailsScan() {
 	if err := uploadAllSystemDataAndDetailsAsBulkCSV(); err != nil {
 		log.Error().Err(err).Msg("Error in uploading group of data csv.")
 	}
+
+	handleBenchmarkAndAuditResult()
 
 	log.Info().Msg("Successfully completed the process of inital full scanning system data and details")
 }
