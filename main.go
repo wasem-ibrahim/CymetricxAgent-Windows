@@ -990,7 +990,7 @@ func createAgentDirectories() {
 	log.Info().Msg("Starting the creation of agent directories...")
 
 	// List of directories to check for their existence and create them if they don't exist.
-	dirs := []string{"Hash Files", "Compressed Files", "Time Files", "Agent Files"}
+	dirs := []string{"Hash Files", "Compressed Files", "Time Files", "Agent Files", "Controls"}
 
 	for _, dir := range dirs {
 		dir = filepath.Join(CymetricxPath, dir)
@@ -7252,6 +7252,11 @@ func processIISControlsV2() error {
 		return fmt.Errorf("failed to get asset controls for iis: %w", err)
 	}
 
+	controlsInputPath := filepath.Join(CymetricxPath, "Controls", "iis-controls-input.json")
+	if err := createFileWithPermissionsAndWriteToIt(controlsInputPath, responseBody.String(), 0644); err != nil {
+		log.Error().Err(err).Msgf("Failed to write to file: %s", controlsInputPath)
+	}
+
 	responseBodyStr := responseBody.String()
 	if responseBodyStr == "" {
 		log.Info().Msg("No asset controls to recheck for iis")
@@ -7275,15 +7280,40 @@ func processIISControlsV2() error {
 
 	log.Info().Msg("IIS controls found for this client v2")
 
-	// Write response body to a file
+	//!
+	// Initialize progress (it may be maintained globally or passed between calls).
+	var controlsProgress ControlsProgress
+	var combinedJsonDataOutput []byte
 
-	jsonDataOutput := processControlsData(responseBodyStr, "IIS")
-	// jsonDataOutputString := string(jsonDataOutput)
+	for {
+		// Process controls for a 10-second window.
+		jsonDataOutput, updatedProgress, err := processControlsData(responseBodyStr, "IIS", &controlsProgress, 10*time.Second)
+		if err != nil {
+			return fmt.Errorf("failed to process controls data: %w", err)
+		}
+		controlsProgress = *updatedProgress
 
-	endPoint = "audit-result/" + iisID
-	_, err = prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", endPoint, jsonDataOutput, 10)
-	if err != nil {
-		return fmt.Errorf("failed to upload iis data v2: %w", err)
+		combinedJsonDataOutput = append(combinedJsonDataOutput, jsonDataOutput...)
+
+		if updatedProgress.FinishedControlsCount > 0 {
+			// Upload the JSON output that includes any finished control results.
+			endPoint := "audit-result/" + iisID
+			_, err = prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", endPoint, jsonDataOutput, 10)
+			if err != nil {
+				return fmt.Errorf("failed to upload audit result: %w", err)
+			}
+		}
+
+		// If there are no more controls to process, exit the loop.
+		if len(controlsProgress.controlsQueue) == 0 && controlsProgress.ActiveProcessCount == 0 {
+			break
+		}
+	}
+	//!
+
+	controlsOutputPath := filepath.Join(CymetricxPath, "Controls", "iis-controls-output.json")
+	if err := createFileWithPermissionsAndWriteToIt(controlsOutputPath, string(combinedJsonDataOutput), 0644); err != nil {
+		log.Error().Err(err).Msgf("Failed to write to file: %s", controlsOutputPath)
 	}
 
 	log.Info().Msg("Successfully processed IIS controls v2.")
@@ -7354,13 +7384,6 @@ func createIISIDAndIISResultsFiles() error {
 	return nil
 }
 
-type ControlsProgress struct {
-	TotalControlsCount         int
-	ProcessedControlsCount     int
-	CurrentControlsLevel       int
-	CurrentLevelProcessedCount int
-}
-
 // processBenchmarkAndAuditResultV2 processes the benchmark and audit result and uploads it to the server
 // If the returned boolean is true, it means that the benchmark is old and no controls were found.
 // That means we need to use the old functions to get the audit result.
@@ -7380,8 +7403,10 @@ func processBenchmarkAndAuditResultV2() (bool, error) {
 		return false, fmt.Errorf("failed to get asset controls: %w", err)
 	}
 
-	controlsInputPath := filepath.Join(CymetricxPath, "controls-input.json")
-	os.WriteFile(controlsInputPath, responseBody.Bytes(), 0644)
+	controlsInputPath := filepath.Join(CymetricxPath, "Controls", "system-controls-input.json")
+	if err := createFileWithPermissionsAndWriteToIt(controlsInputPath, responseBody.String(), 0644); err != nil {
+		log.Error().Err(err).Msgf("Failed to write to file: %s", controlsInputPath)
+	}
 
 	responseBodyStr := responseBody.String()
 	if responseBodyStr == "" {
@@ -7404,46 +7429,41 @@ func processBenchmarkAndAuditResultV2() (bool, error) {
 		return true, nil
 	}
 
-	finished := false
-
-	controlsProgress := ControlsProgress{
-		TotalControlsCount:         0,
-		ProcessedControlsCount:     0,
-		CurrentControlsLevel:       0,
-		CurrentLevelProcessedCount: 0,
-	}
-
-	var jsonDataOutput []byte
+	// Initialize progress (it may be maintained globally or passed between calls).
+	var controlsProgress ControlsProgress
 	var combinedJsonDataOutput []byte
-	for !finished {
-		jsonDataOutput, controlsProgress, err = processControlsData4(responseBodyStr, "System Controls", controlsProgress)
+
+	for {
+		// Process controls for a 10-second window.
+		jsonDataOutput, updatedProgress, err := processControlsData(responseBodyStr, "System Controls", &controlsProgress, 10*time.Second)
 		if err != nil {
 			exitCommandCheck = true
 			return false, fmt.Errorf("failed to process controls data: %w", err)
 		}
+		controlsProgress = *updatedProgress
 
 		combinedJsonDataOutput = append(combinedJsonDataOutput, jsonDataOutput...)
 
-		if controlsProgress.ProcessedControlsCount == controlsProgress.TotalControlsCount && controlsProgress.TotalControlsCount != 0 {
-			finished = true
+		if updatedProgress.FinishedControlsCount > 0 {
+			// Upload the JSON output that includes any finished control results.
+			endPoint := "audit-result/" + id
+			_, err = prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", endPoint, jsonDataOutput, 10)
+			if err != nil {
+				exitCommandCheck = true
+				return false, fmt.Errorf("failed to upload audit result: %w", err)
+			}
 		}
 
-		fmt.Println("TotalControlsNumber: ", controlsProgress.TotalControlsCount)
-		fmt.Println("FinishedControlsNumber: ", controlsProgress.ProcessedControlsCount)
-		fmt.Println("BeingProcessedLevel: ", controlsProgress.CurrentControlsLevel)
-		fmt.Println("FinshedForCurrentLevel: ", controlsProgress.CurrentLevelProcessedCount)
-
-		endPoint := "audit-result/" + id
-		var err error
-		_, err = prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", endPoint, jsonDataOutput, 10)
-		if err != nil {
-			exitCommandCheck = true
-			return false, fmt.Errorf("failed to upload audit result: %w", err)
+		// If there are no more controls to process, exit the loop.
+		if len(controlsProgress.controlsQueue) == 0 && controlsProgress.ActiveProcessCount == 0 {
+			break
 		}
 	}
 
-	controlsOutputPath := filepath.Join(CymetricxPath, "controls-output.json")
-	os.WriteFile(controlsOutputPath, combinedJsonDataOutput, 0644)
+	controlsOutputPath := filepath.Join(CymetricxPath, "Controls", "system-controls-output.json")
+	if err := createFileWithPermissionsAndWriteToIt(controlsOutputPath, string(combinedJsonDataOutput), 0644); err != nil {
+		log.Error().Err(err).Msgf("Failed to write to file: %s", controlsOutputPath)
+	}
 
 	exitCommandCheck = true
 
@@ -7498,6 +7518,12 @@ func processBenchmarkAndAuditResultForSingleProduct(productName, productID, prod
 		return fmt.Errorf("failed to get asset controls for products: %w", err)
 	}
 
+	controlsFileName := fmt.Sprintf("%s-controls-input.json", productName)
+	controlsInputPath := filepath.Join(CymetricxPath, "Controls", controlsFileName)
+	if err := createFileWithPermissionsAndWriteToIt(controlsInputPath, responseBody.String(), 0644); err != nil {
+		log.Error().Err(err).Msgf("Failed to write to file: %s", controlsInputPath)
+	}
+
 	responseBodyStr := responseBody.String()
 	if responseBodyStr == "" {
 		log.Info().Msg("No asset controls to recheck for products.")
@@ -7512,13 +7538,39 @@ func processBenchmarkAndAuditResultForSingleProduct(productName, productID, prod
 		return fmt.Errorf("failed to unmarshal response body for products: %w", err)
 	}
 
-	jsonDataOutput := processControlsData(responseBodyStr, productName)
+	// Initialize progress (it may be maintained globally or passed between calls).
+	var controlsProgress ControlsProgress
+	var combinedJsonDataOutput []byte
 
-	endPoint = "audit-products-result/" + productID
-	_, err = prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", endPoint, jsonDataOutput, 10)
-	if err != nil {
-		exitCommandCheck = true
-		return fmt.Errorf("failed to upload audit result for products: %w", err)
+	for {
+		// Process controls for a 10-second window.
+		jsonDataOutput, updatedProgress, err := processControlsData(responseBodyStr, productName, &controlsProgress, 10*time.Second)
+		if err != nil {
+			return fmt.Errorf("failed to process controls data: %w", err)
+		}
+		controlsProgress = *updatedProgress
+
+		combinedJsonDataOutput = append(combinedJsonDataOutput, jsonDataOutput...)
+
+		if updatedProgress.FinishedControlsCount > 0 {
+			// Upload the JSON output that includes any finished control results.
+			endPoint = "audit-products-result/" + productID
+			_, err = prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", endPoint, jsonDataOutput, 10)
+			if err != nil {
+				return fmt.Errorf("failed to upload audit result: %w", err)
+			}
+		}
+
+		// If there are no more controls to process, exit the loop.
+		if len(controlsProgress.controlsQueue) == 0 && controlsProgress.ActiveProcessCount == 0 {
+			break
+		}
+	}
+
+	controlsFileName = fmt.Sprintf("%s-controls-output.json", productName)
+	controlsOutputPath := filepath.Join(CymetricxPath, "Controls", controlsFileName)
+	if err := createFileWithPermissionsAndWriteToIt(controlsOutputPath, string(combinedJsonDataOutput), 0644); err != nil {
+		log.Error().Err(err).Msgf("Failed to write to file: %s", controlsOutputPath)
 	}
 
 	exitCommandCheck = true
@@ -9720,6 +9772,8 @@ func audit_result(command string, ifCallLaravel bool) (string, error) {
 func startInitialFullSystemDataAndDetailsScan() {
 	log.Info().Msg("Starting the process of initial full scanning system data and details ... ")
 
+	handleBenchmarkAndAuditResult()
+
 	tasks := []*UploadTask{
 		{
 			File: "system-details-timer.txt",
@@ -9767,8 +9821,6 @@ func startInitialFullSystemDataAndDetailsScan() {
 	if err := uploadAllSystemDataAndDetailsAsBulkCSV(); err != nil {
 		log.Error().Err(err).Msg("Error in uploading group of data csv.")
 	}
-
-	handleBenchmarkAndAuditResult()
 
 	log.Info().Msg("Successfully completed the process of inital full scanning system data and details")
 }
@@ -12007,7 +12059,7 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 			log.Error().Err(err).Msg("Failed to send rescan_received message to redis server.")
 		}
 
-		go rescanAndCompressAndUploadEverthing(rdb)
+		rescanAndCompressAndUploadEverthing(rdb)
 	}
 
 	if responseBody.Updates {
@@ -13676,36 +13728,6 @@ func processIfBlock(ifBlock map[string]interface{}, variables map[string]string,
 	return ifBlock, false
 }
 
-/*
-// Check if "if" block exists and process it
-	if ifBlock, ok := thenBlock["if"]; ok {
-		ifBlockResult, ifReport := processIfBlock(ifBlock.(map[string]interface{}), variables, handlers)
-		thenBlock["if"] = ifBlockResult
-		return map[string]interface{}{"then": thenBlock}, ifReport
-	}
-
-	// Return nil and false if no "report" or "custom_item" blocks are found
-	return nil, false
-}
-
-// Process "if" block
-func processIfBlock(ifBlock map[string]interface{}, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]interface{}, bool)) (map[string]interface{}, bool) {
-	condition := ifBlock["condition"].(map[string]interface{})
-	conditionResult, pass := processCondition(condition, variables, handlers)
-	ifBlock["condition"] = conditionResult
-	if pass {
-		thenBlockResult, thenReport := processThen(ifBlock["then"].(map[string]interface{}), variables, handlers)
-		ifBlock["then"] = thenBlockResult
-		return ifBlock, thenReport
-	} else if elseBlock, ok := ifBlock["else"]; ok {
-		elseBlockResult, elseReport := processThen(elseBlock.(map[string]interface{}), variables, handlers)
-		ifBlock["else"] = elseBlockResult
-		return ifBlock, elseReport
-	}
-	return ifBlock, false
-}
-*/
-
 // Process a single control using handlers
 func processSingleControl(control map[string]string, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), benchmarkType string) map[string]string {
 	if objType, ok := control["type"]; ok {
@@ -13743,326 +13765,6 @@ func processSingleControl(control map[string]string, variables map[string]string
 	}
 }
 
-// Function to process the JSON data
-func processControlsData(jsonData, benchmarkType string) []byte {
-	// Unmarshal the JSON into a slice of maps
-	var levels []map[string]interface{}
-	err := json.Unmarshal([]byte(jsonData), &levels)
-	if err != nil {
-		log.Error().Err(err).Msg("Error unmarshalling JSON data for processing controls")
-		return nil
-	}
-
-	// Define a map of handlers
-	handlers := map[string]func(map[string]string, map[string]string) (map[string]string, error){
-		"PASSWORD_POLICY":          controls.GetPasswordPolicy,
-		"REGISTRY_SETTING":         controls.GetRegistrySetting,
-		"LOCKOUT_POLICY":           controls.GetLockouPolicy,
-		"AUDIT_POLICY_SUBCATEGORY": controls.GetAuditPolicySubcategory,
-		"REG_CHECK":                controls.GetRegCheck,
-		"USER_RIGHTS_POLICY":       controls.GetUserRightsPolicy,
-		"CHECK_ACCOUNT":            controls.GetCheckAccount,
-		"BANNER_CHECK":             controls.GetBannerCheck,
-		"AUDIT_POWERSHELL":         controls.GetAuditPowershell,
-		"GUID_REGISTRY_SETTING":    controls.GetGuidRegistrySetting,
-		"FILE_CONTENT_CHECK":       controls.GetFileContentCheck,
-		"FILE_CHECK":               controls.GetFileCheck,
-	}
-
-	var jsonDataOutputCombined []interface{}
-
-	// totalControlsNumber := 0
-	// finishedControlsNumber := 0
-
-	// Iterate over each level
-	for _, level := range levels {
-		// Process variables
-		variables := make(map[string]string)
-		if vars, ok := level["variables"].(map[string]interface{}); ok {
-			variables = processVariables(vars)
-		} else {
-			// fmt.Println("Failed to assert variables as a map")
-			log.Error().Msg("Failed to assert variables as a map")
-		}
-
-		// Convert and process controls
-		if controls, ok := level["controls"].([]interface{}); ok {
-			convertedControls := convertControls(controls)
-
-			jsonDataOutput := processControls(convertedControls, handlers, variables, benchmarkType)
-			jsonDataOutputCombined = append(jsonDataOutputCombined, jsonDataOutput...)
-
-			jsonOutput, err := json.Marshal(jsonDataOutputCombined)
-			if err != nil {
-				log.Error().Err(err).Msg("Error marshalling JSON data for processing controls")
-			}
-
-			return jsonOutput
-
-			// return jsonDataOutput
-		} else {
-			log.Error().Msg("Failed to assert controls as a slice")
-			continue
-		}
-	}
-
-	//return []byte
-	// return bytes.Join(jsonDataOutputCombined, []byte("\n"))
-
-	jsonOutput, err := json.Marshal(jsonDataOutputCombined)
-	if err != nil {
-		log.Error().Err(err).Msg("Error marshalling JSON data for processing controls")
-	}
-
-	return jsonOutput
-
-	// return nil
-
-}
-
-func processControlsData2(jsonData, benchmarkType string, totalControlsNumber, finishedControlsNumber int) ([]byte, int, int) {
-	// Unmarshal the JSON into a slice of maps
-	var levels []map[string]interface{}
-	err := json.Unmarshal([]byte(jsonData), &levels)
-	if err != nil {
-		log.Error().Err(err).Msg("Error unmarshalling JSON data for processing controls")
-		return nil, 0, 0
-	}
-
-	// Define a map of handlers
-	handlers := map[string]func(map[string]string, map[string]string) (map[string]string, error){
-		"PASSWORD_POLICY":          controls.GetPasswordPolicy,
-		"REGISTRY_SETTING":         controls.GetRegistrySetting,
-		"LOCKOUT_POLICY":           controls.GetLockouPolicy,
-		"AUDIT_POLICY_SUBCATEGORY": controls.GetAuditPolicySubcategory,
-		"REG_CHECK":                controls.GetRegCheck,
-		"USER_RIGHTS_POLICY":       controls.GetUserRightsPolicy,
-		"CHECK_ACCOUNT":            controls.GetCheckAccount,
-		"BANNER_CHECK":             controls.GetBannerCheck,
-		"AUDIT_POWERSHELL":         controls.GetAuditPowershell,
-		"GUID_REGISTRY_SETTING":    controls.GetGuidRegistrySetting,
-		"FILE_CONTENT_CHECK":       controls.GetFileContentCheck,
-		"FILE_CHECK":               controls.GetFileCheck,
-	}
-
-	var jsonDataOutputCombined []interface{}
-
-	// totalControlsNumber := 0
-	// finishedControlsNumber := 0
-
-	for _, level := range levels {
-		// count the number of controls:
-		if controls, ok := level["controls"].([]interface{}); ok {
-			totalControlsNumber = len(controls)
-		}
-	}
-
-	// Iterate over each level
-	for _, level := range levels {
-		// Process variables
-		variables := make(map[string]string)
-		if vars, ok := level["variables"].(map[string]interface{}); ok {
-			variables = processVariables(vars)
-		} else {
-			// fmt.Println("Failed to assert variables as a map")
-			log.Error().Msg("Failed to assert variables as a map")
-		}
-
-		// Convert and process controls
-		if controls, ok := level["controls"].([]interface{}); ok {
-			convertedControls := convertControls(controls)
-
-			var convertedControlsSubset []map[string]interface{}
-			if len(convertedControls)-finishedControlsNumber < 10 {
-				convertedControlsSubset = convertedControls[finishedControlsNumber:]
-				finishedControlsNumber = finishedControlsNumber + len(convertedControlsSubset)
-			} else {
-				convertedControlsSubset = convertedControls[finishedControlsNumber : finishedControlsNumber+10]
-				finishedControlsNumber = finishedControlsNumber + 10
-			}
-
-			for _, control := range convertedControlsSubset {
-				jsonDataOutput := processControls2(control, handlers, variables, benchmarkType)
-				jsonDataOutputCombined = append(jsonDataOutputCombined, jsonDataOutput...)
-			}
-
-			type ControlOutput struct {
-				ControlOutput          []interface{} `json:"controls"`
-				FinishedControlsNumber int           `json:"finish"`
-				TotalControlsNumber    int           `json:"total"`
-			}
-
-			retrunedMap := ControlOutput{
-				ControlOutput:          jsonDataOutputCombined,
-				FinishedControlsNumber: finishedControlsNumber,
-				TotalControlsNumber:    totalControlsNumber,
-			}
-
-			jsonOutput1, err := json.Marshal(retrunedMap)
-			if err != nil {
-				log.Error().Err(err).Msg("Error marshalling JSON data for processing controls")
-			}
-			return jsonOutput1, totalControlsNumber, finishedControlsNumber
-
-			// return jsonDataOutput
-		} else {
-			log.Error().Msg("Failed to assert controls as a slice")
-			continue
-		}
-	}
-
-	//return []byte
-	// return bytes.Join(jsonDataOutputCombined, []byte("\n"))
-
-	jsonOutput, err := json.Marshal(jsonDataOutputCombined)
-	if err != nil {
-		log.Error().Err(err).Msg("Error marshalling JSON data for processing controls")
-	}
-
-	return jsonOutput, totalControlsNumber, finishedControlsNumber
-
-	// return nil
-
-}
-
-// processControlsData3 processes controls sequentially with a 10-second timer.
-// It processes controls one by one. If the timer expires while a control is in progress,
-// the function waits for that control to finish and then stops processing any further controls.
-// Finally, it marshals the output (with the number of finished controls and total controls)
-// into JSON and returns it.
-func processControlsData3(jsonData, benchmarkType string, finishedControlsNumber int, metaData map[string]int) ([]byte, int, int, map[string]int) {
-
-	// Unmarshal the JSON data into a slice of levels
-	var levels []map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonData), &levels); err != nil {
-		log.Printf("Error unmarshalling JSON data: %v", err)
-		return nil, 0, 0, nil
-	}
-
-	// Define a map of control handlers
-	handlers := map[string]func(map[string]string, map[string]string) (map[string]string, error){
-		"PASSWORD_POLICY":          controls.GetPasswordPolicy,
-		"REGISTRY_SETTING":         controls.GetRegistrySetting,
-		"LOCKOUT_POLICY":           controls.GetLockouPolicy,
-		"AUDIT_POLICY_SUBCATEGORY": controls.GetAuditPolicySubcategory,
-		"REG_CHECK":                controls.GetRegCheck,
-		"USER_RIGHTS_POLICY":       controls.GetUserRightsPolicy,
-		"CHECK_ACCOUNT":            controls.GetCheckAccount,
-		"BANNER_CHECK":             controls.GetBannerCheck,
-		"AUDIT_POWERSHELL":         controls.GetAuditPowershell,
-		"GUID_REGISTRY_SETTING":    controls.GetGuidRegistrySetting,
-		"FILE_CONTENT_CHECK":       controls.GetFileContentCheck,
-		"FILE_CHECK":               controls.GetFileCheck,
-	}
-
-	// Compute the total number of controls across all levels.
-	// (If you only have one level, this will be that level's count.)
-	totalControlsNumber := 0
-	for _, level := range levels {
-		if ctrls, ok := level["controls"].([]interface{}); ok {
-			totalControlsNumber += len(ctrls)
-			metaData["totalControlsNumber"] = totalControlsNumber
-		}
-	}
-
-	// This slice will hold the combined results of processing each control.
-	var jsonDataOutputCombined []interface{}
-
-	// Create a timer that expires in 10 seconds.
-	fmt.Println("Starting timer:", time.Now())
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-
-	// Use finishedCount to track how many controls have been processed so far.
-	finishedCount := finishedControlsNumber
-	fmt.Println("Finished count: ", finishedCount)
-
-	// Process each level sequentially.
-outerLoop:
-	for i, level := range levels {
-		beingProcessedLevel := metaData["beingProcessedLevel"]
-		if beingProcessedLevel != i {
-			metaData["beingProcessedLevel"] = i
-			metaData["finshedForCurrentLevel"] = 0
-		}
-		finshedForCurrentLevel := metaData["finshedForCurrentLevel"]
-
-		// Process level variables.
-		var variables map[string]string
-		if vars, ok := level["variables"].(map[string]interface{}); ok {
-			variables = processVariables(vars)
-		} else {
-			log.Print("Failed to assert variables as a map")
-		}
-
-		// Get the controls and convert them.
-		controlsInterface, ok := level["controls"].([]interface{})
-		if !ok {
-			log.Print("Failed to assert controls as a slice")
-			continue
-		}
-		convertedControls := convertControls(controlsInterface)
-
-		// Process each control one by one.
-		for i := finshedForCurrentLevel; i < len(convertedControls); i++ {
-			fmt.Println("Processing control ", i)
-			// Before starting a new control, check if the timer has already fired.
-			// If so, break out of all loops (we do not start a new control).
-			select {
-			case <-timer.C:
-				// Timer expired: break out.
-				break outerLoop
-			default:
-				// Timer has not yet expired; continue.
-			}
-
-			// Process the current control.
-			control := convertedControls[i]
-			controlResult := processControls2(control, handlers, variables, benchmarkType)
-			// Append the result (assuming processControls2 returns a slice of output values).
-			jsonDataOutputCombined = append(jsonDataOutputCombined, controlResult...)
-			finishedCount++
-			finshedForCurrentLevel++
-			metaData["finishedControlsNumber"] = finishedCount
-			metaData["finshedForCurrentLevel"] = finshedForCurrentLevel
-
-			// After processing a control, check again if the timer has fired.
-			// This helps catch the case where a control ran past 10 seconds.
-			select {
-			case <-timer.C:
-				break outerLoop
-			default:
-			}
-		}
-	}
-
-	fmt.Println("Ending timer:", time.Now())
-
-	// Prepare the output structure.
-	type ControlOutput struct {
-		ControlOutput          []interface{} `json:"controls"`
-		FinishedControlsNumber int           `json:"finish"`
-		TotalControlsNumber    int           `json:"total"`
-	}
-
-	outputStruct := ControlOutput{
-		ControlOutput:          jsonDataOutputCombined,
-		FinishedControlsNumber: finishedCount,
-		TotalControlsNumber:    totalControlsNumber,
-	}
-
-	// Marshal the output structure to JSON.
-	jsonOutput, err := json.Marshal(outputStruct)
-	if err != nil {
-		log.Printf("Error marshalling JSON data: %v", err)
-		return nil, totalControlsNumber, finishedCount, nil
-	}
-
-	return jsonOutput, totalControlsNumber, finishedCount, metaData
-}
-
-//! 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-
 // ControlsOutput is the structure used to marshal the final JSON output.
 type ControlsOutput struct {
 	ControlOutput          []interface{} `json:"controls"`
@@ -14070,72 +13772,153 @@ type ControlsOutput struct {
 	TotalControlsNumber    int           `json:"total"`
 }
 
-// processControlsData3 processes controls sequentially with a timer.
-// It goes level-by-level and control-by-control until the timer expires,
-// waiting for an in-progress control to finish before stopping further processing.
-func processControlsData4(jsonData, benchmarkType string, controlsProgress ControlsProgress) ([]byte, ControlsProgress, error) {
+// ControlsProgress holds state across invocations.
+type ControlsProgress struct {
+	StartedProcessingControlsCount int               // controls started
+	TotalControlsCount             int               // total controls available
+	controlsQueue                  []controlWithVars // controls to process
+	ActiveProcessCount             int               // number of controls currently running
+	ResultChan                     chan interface{}  // persistent result channel for controls
+	FinishedControlsCount          int               // controls finished processing
+}
+
+// controlWithVars is a struct that holds a control and its variables.
+type controlWithVars struct {
+	control   map[string]interface{}
+	variables map[string]string
+}
+
+// processControlsData processes controls for up to `timeout`
+// duration, launching up to 3 controls concurrently. If a control was started before
+// the timeout and hasn't finished, it is left running; meanwhile, additional controls
+// are started until 3 are running.
+func processControlsData(jsonData, benchmarkType string, progress *ControlsProgress, timeout time.Duration) ([]byte, *ControlsProgress, error) {
+	// Initialize the controls queue (if not already done).
+	if err := initializeControlsQueue(jsonData, progress); err != nil {
+		return nil, progress, err
+	}
+
+	// Process controls within the given timeout.
+	finishedResults := processControlsWithinTimeout(benchmarkType, progress, timeout)
+
+	// Build the output JSON.
+	jsonOutput, err := buildControlsOutput(progress, finishedResults)
+	if err != nil {
+		return nil, progress, err
+	}
+
+	return jsonOutput, progress, nil
+}
+
+func initializeControlsQueue(jsonData string, progress *ControlsProgress) error {
+	if progress.controlsQueue != nil {
+		// Already initialized.
+		return nil
+	}
 	levels, err := parseLevels(jsonData)
 	if err != nil {
-		return nil, ControlsProgress{}, fmt.Errorf("error unmarshalling JSON data: %w", err)
+		return fmt.Errorf("error unmarshalling JSON data: %w", err)
 	}
+	progress.TotalControlsCount = computeTotalControls(levels)
+	progress.controlsQueue = make([]controlWithVars, 0, progress.TotalControlsCount)
+	progress.ResultChan = make(chan interface{}, 50) // buffered channel
 
-	handlers := getControlHandlers()
-	controlsProgress.TotalControlsCount = computeTotalControls(levels)
-
-	var controlsOutput []interface{}
-
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-
-outerLoop:
-	for levelIndex, level := range levels {
-		updateLevelMetaData(levelIndex, &controlsProgress)
-
+	// Loop through levels and build the queue.
+	for _, level := range levels {
 		variables, err := extractVariables(level)
 		if err != nil {
-			return nil, ControlsProgress{}, fmt.Errorf("failed to extract variables: %w", err)
+			return fmt.Errorf("failed to extract variables: %w", err)
 		}
-
 		controlsSlice, err := extractControls(level)
 		if err != nil {
-			return nil, ControlsProgress{}, fmt.Errorf("failed to extract controls: %w", err)
+			return fmt.Errorf("failed to extract controls: %w", err)
 		}
-
 		convertedControls := convertControls(controlsSlice)
-
-		for i := controlsProgress.CurrentLevelProcessedCount; i < len(convertedControls); i++ {
-			// Before starting a new control, check if the timer has fired.
-			if timerExpired(timer) {
-				break outerLoop
-			}
-
-			// Process the current control.
-			controlResult := processControls2(convertedControls[i], handlers, variables, benchmarkType)
-			controlsOutput = append(controlsOutput, controlResult...)
-
-			// Update counts and metaData.
-			controlsProgress.ProcessedControlsCount++
-			controlsProgress.CurrentLevelProcessedCount++
-
-			// Check again after processing in case the timer fired mid-control.
-			if timerExpired(timer) {
-				break outerLoop
-			}
+		for _, ctrl := range convertedControls {
+			// Assuming ctrl is of type map[string]interface{}.
+			progress.controlsQueue = append(progress.controlsQueue, controlWithVars{
+				control:   ctrl,
+				variables: variables,
+			})
 		}
 	}
+	return nil
+}
+
+func processControlsWithinTimeout(benchmarkType string, progress *ControlsProgress, timeout time.Duration) []interface{} {
+	var finishedResults []interface{}
+	deadline := time.Now().Add(timeout)
+	resultChan := progress.ResultChan
+
+deadlineLoop:
+	for time.Now().Before(deadline) {
+		// Start new controls if there's room.
+		for progress.ActiveProcessCount < 3 && len(progress.controlsQueue) > 0 {
+			next := progress.controlsQueue[0]
+			progress.controlsQueue = progress.controlsQueue[1:]
+			progress.StartedProcessingControlsCount++
+			progress.ActiveProcessCount++
+
+			// Launch the control in its own goroutine.
+			go func(ctrl controlWithVars) {
+				// processControls2 returns a slice; here we take the first element.
+				res := processControls2(ctrl.control, getControlHandlers(), ctrl.variables, benchmarkType)
+				resultChan <- res[0]
+			}(next)
+		}
+
+		// Drain any available results before waiting.
+		for {
+			select {
+			case res := <-resultChan:
+				finishedResults = append(finishedResults, res)
+				progress.ActiveProcessCount--
+			default:
+				// No more results available right now.
+				break
+			}
+			// If resultChan is empty, break the inner loop.
+			if len(resultChan) == 0 {
+				break
+			}
+		}
+
+		// Check if everything has been processed.
+		if len(progress.controlsQueue) == 0 && progress.ActiveProcessCount == 0 {
+			break deadlineLoop
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break deadlineLoop
+		}
+
+		// Wait for either a result or until the remaining time expires.
+		select {
+		case res := <-resultChan:
+			finishedResults = append(finishedResults, res)
+			progress.ActiveProcessCount--
+		case <-time.After(remaining):
+			break deadlineLoop
+		}
+	}
+	return finishedResults
+}
+
+func buildControlsOutput(progress *ControlsProgress, finishedResults []interface{}) ([]byte, error) {
+	progress.FinishedControlsCount = len(finishedResults)
 
 	outputStruct := ControlsOutput{
-		ControlOutput:          controlsOutput,
-		FinishedControlsNumber: controlsProgress.ProcessedControlsCount,
-		TotalControlsNumber:    controlsProgress.TotalControlsCount,
+		ControlOutput:          finishedResults,
+		FinishedControlsNumber: progress.StartedProcessingControlsCount - progress.ActiveProcessCount,
+		TotalControlsNumber:    progress.TotalControlsCount,
 	}
 
 	jsonOutput, err := json.Marshal(outputStruct)
 	if err != nil {
-		return nil, ControlsProgress{}, fmt.Errorf("error marshalling JSON output: %w", err)
+		return nil, fmt.Errorf("error marshalling JSON output for controls: %w", err)
 	}
-
-	return jsonOutput, controlsProgress, nil
+	return jsonOutput, nil
 }
 
 // parseLevels unmarshals the JSON string into a slice of levels.
@@ -14177,21 +13960,13 @@ func computeTotalControls(levels []map[string]interface{}) int {
 	return total
 }
 
-// updateLevelMetaData resets per-level counters in metaData if a new level is reached.
-func updateLevelMetaData(levelIndex int, controlsProgress *ControlsProgress) {
-	// Update current level and reset counters if a new level is reached.
-	// This is so we could track the number of controls processed for each level.
-	if controlsProgress.CurrentControlsLevel != levelIndex {
-		controlsProgress.CurrentControlsLevel = levelIndex
-		controlsProgress.CurrentLevelProcessedCount = 0
-	}
-}
-
 // extractVariables converts the "variables" field from a level into a map[string]string.
 func extractVariables(level map[string]interface{}) (map[string]string, error) {
 	vars, ok := level["variables"].(map[string]interface{})
 	if !ok {
-		return nil, errors.New("failed to assert variables as a map")
+		// If no variables, return empty map.
+		return make(map[string]string), nil
+		// return nil, fmt.Errorf("failed to assert variables as a map: %v", level["variables"])
 	}
 
 	return processVariables(vars), nil
@@ -14201,18 +13976,8 @@ func extractVariables(level map[string]interface{}) (map[string]string, error) {
 func extractControls(level map[string]interface{}) ([]interface{}, error) {
 	controlsInterface, ok := level["controls"].([]interface{})
 	if !ok {
-		return nil, errors.New("failed to assert controls as a slice")
+		return nil, fmt.Errorf("failed to assert controls as a slice: %v", level["controls"])
 	}
 
 	return controlsInterface, nil
-}
-
-// timerExpired checks whether the timer has already fired.
-func timerExpired(timer *time.Timer) bool {
-	select {
-	case <-timer.C:
-		return true
-	default:
-		return false
-	}
 }

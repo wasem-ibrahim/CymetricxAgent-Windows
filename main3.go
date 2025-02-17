@@ -1,16 +1,12 @@
 package main
 
-import (
-	"fmt"
-)
-
 func main3() {
 
 	// Simulate getting JSON data from server
-	jsonData := getJSONData()
+	// jsonData := getJSONData()
 
 	// Process the JSON data
-	jsonDataOutput := processControlsData(jsonData, "System Controls")
+	// jsonDataOutput := processControlsData(jsonData, "System Controls")
 
 	// Export it to a file
 	// err := os.WriteFile("output.json", jsonDataOutput, 0644)
@@ -18,8 +14,8 @@ func main3() {
 	// 	log.Fatal(err)
 	// }
 
-	jsonDataOutputString := string(jsonDataOutput)
-	fmt.Println(jsonDataOutputString)
+	// jsonDataOutputString := string(jsonDataOutput)
+	// fmt.Println(jsonDataOutputString)
 }
 
 // Function to get JSON data (simulate server response for testing purposes)
