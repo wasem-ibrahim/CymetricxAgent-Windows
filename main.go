@@ -13317,104 +13317,7 @@ func checkIfReturnedMapIsControl(control map[string]string, controlResultList []
 	return false
 }
 
-// Process controls using the handlers
-// func processControls(controls []map[string]interface{}, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), variables map[string]string) []byte {
-func processControls(controls []map[string]interface{}, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), variables map[string]string, benchmarkType string) []interface{} {
-	var combinedList []interface{}
-	for _, control := range controls {
-		var controlResultList []interface{}
-		automatedValue := "true"
-		if controlType, ok := control["item_type"]; ok && controlType == "condition" {
-			conditionControlMap := make(map[string]interface{})
-
-			// Process the condition block
-			condition := control["condition"].(map[string]interface{})
-			condtionKeyMap, autoKeyValue, ifPassed := processCondition(condition, variables, handlers, &controlResultList, &automatedValue, benchmarkType)
-			conditionControlMap["condition"] = condtionKeyMap
-
-			if ifPassed {
-				thenMapList, ifReport := processThen(control["then"].(map[string]interface{}), variables, handlers, &controlResultList, true, &automatedValue, autoKeyValue, benchmarkType)
-				conditionControlMap["then"] = thenMapList
-				if ifReport {
-					// read the item block and return it with status true
-					// The control passed
-					itemMaps := processItem(control, "true")
-					conditionControlMap["control_result"] = itemMaps
-				} else {
-					conditionControlMap["then"] = thenMapList
-				}
-			} else if elseControl, ok := control["else"]; ok {
-				// else block has the same logic as the "then" block
-				thenMapList, ifReport := processThen(elseControl.(map[string]interface{}), variables, handlers, &controlResultList, false, &automatedValue, autoKeyValue, benchmarkType)
-				if ifReport {
-					// read the item block and return it with status true
-					// The control passed
-					itemMaps := processItem(control, "true")
-					conditionControlMap["control_result"] = itemMaps
-				} else {
-					conditionControlMap["else"] = thenMapList
-				}
-			} else if !ifPassed {
-				// if no else, then go back to then and you'll find the report block which you give false status
-				if _, ok := control["then"]; ok {
-					thenMapList, ifReport := processThen(control["then"].(map[string]interface{}), variables, handlers, &controlResultList, false, &automatedValue, autoKeyValue, benchmarkType)
-					conditionControlMap["then"] = thenMapList
-					if ifReport {
-						// read the item block and return it with status true
-						// The control passed
-						itemMaps := processItem(control, "true")
-						conditionControlMap["control_result"] = itemMaps
-					} else {
-						conditionControlMap["then"] = thenMapList
-					}
-					// Case where the condition is false and there is no else block
-					// read the item block and return it with status false
-					// returnedMap := processSingleControl(convertedItem, variables, handlers)
-					itemMaps := processItem(control, "false")
-					conditionControlMap["item"] = itemMaps
-				}
-			}
-
-			conditionControlMap["item_type"] = "condition"
-			conditionControlMap["item"] = control["item"]
-			// add controlResultMap to be a value to a key "control_result"
-			var controlResultMap = map[string]interface{}{
-				"control_result": controlResultList,
-			}
-
-			// go over object in controlResultList and add "automated" key to each object
-			for _, controlResult := range controlResultList {
-				controlResultMap := controlResult.(map[string]string)
-				controlResultMap["automated"] = automatedValue
-			}
-
-			combinedList = append(combinedList, controlResultMap)
-		} else {
-			var returnedMaps []map[string]string
-
-			// Normal control processing
-			strMap := make(map[string]string)
-			for key, value := range control {
-				if strVal, ok := value.(string); ok {
-					strMap[key] = strVal
-				}
-			}
-			returnedMap := processSingleControl(strMap, variables, handlers, benchmarkType)
-			if returnedMap != nil {
-				returnedMaps = append(returnedMaps, returnedMap)
-			}
-
-			// Append the returned map to the combined list
-			for _, returnedMap := range returnedMaps {
-				combinedList = append(combinedList, returnedMap)
-			}
-		}
-	}
-
-	return combinedList
-}
-
-func processControls2(control map[string]interface{}, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), variables map[string]string, benchmarkType string) []interface{} {
+func processControls(control map[string]interface{}, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), variables map[string]string, benchmarkType string) []interface{} {
 	var combinedList []interface{}
 	var controlResultList []interface{}
 	automatedValue := "true"
@@ -13506,6 +13409,7 @@ func processControls2(control map[string]interface{}, handlers map[string]func(m
 
 	return combinedList
 }
+
 func processItem(control map[string]interface{}, status string) []map[string]string {
 	var itemMaps []map[string]string
 
@@ -13862,7 +13766,7 @@ deadlineLoop:
 			// Launch the control in its own goroutine.
 			go func(ctrl controlWithVars) {
 				// processControls2 returns a slice; here we take the first element.
-				res := processControls2(ctrl.control, getControlHandlers(), ctrl.variables, benchmarkType)
+				res := processControls(ctrl.control, getControlHandlers(), ctrl.variables, benchmarkType)
 				resultChan <- res[0]
 			}(next)
 		}
