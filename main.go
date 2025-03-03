@@ -2876,17 +2876,25 @@ func terminateCymetricxm() {
 // stopAndRemoveRunUpgradeService stops and removes the runupgrade service
 func stopAndRemoveRunUpgradeService() {
 	log.Info().Msg("Attempting to stop and remove the runupgrade service.")
-
-	batchFileContents := []byte(
-		"cymetricxm.exe stop runupgrade \n" +
-			"cymetricxm.exe remove runupgrade confirm",
-	)
+	scFilePath := getSCPath()
+	var batchFileContents []byte
+	if scFilePath != "" {
+		batchFileContents = []byte(strings.Join([]string{
+			fmt.Sprintf(`%s stop "runupgrade" `, scFilePath),
+			fmt.Sprintf(`%s  delete "runupgrade" `, scFilePath),
+		}, "\n"))
+	} else {
+		batchFileContents = []byte(
+			"cymetricxm.exe stop runupgrade \n" +
+				"cymetricxm.exe remove runupgrade confirm",
+		)
+	}
 
 	filePath := filepath.Join(CymetricxPath, "stop_and_remove_runupgrade.bat")
 	if err := createFileWithPermissionsAndWriteToIt(filePath, string(batchFileContents), 0744); err != nil {
 		log.Error().Err(err).Msg("Failed to write to stop_and_remove_runupgrade.bat.")
 	}
-	defer os.Remove("stop_and_remove_runupgrade.bat")
+	//defer os.Remove("stop_and_remove_runupgrade.bat")
 
 	err := execCommandWithoutOutput(filePath)
 	if err == nil {
@@ -13772,7 +13780,7 @@ deadlineLoop:
 			progress.StartedProcessingControlsCount++
 			progress.ActiveProcessCount++
 
-			// Launch the control in its own goroutine.
+			// Lfaunch the control in its own goroutine.
 			go func(ctrl controlWithVars) {
 				// processControls2 returns a slice; here we take the first element.
 				res := processControls(ctrl.control, getControlHandlers(), ctrl.variables, benchmarkType)
