@@ -190,7 +190,7 @@ var apiURLLaravel = "" //"https://157.175.205.169/cymetricx_api/" // Cloud one
 // by multiple goroutines.
 var client = createInsecureHttpClient()
 
-const AgentVersion = "4.9.7"
+const AgentVersion = "4.9.26"
 
 const CymetricxPath = "C:\\Program Files\\CYMETRICX"
 
@@ -523,14 +523,14 @@ func setupLoggerSettings() {
 
 	ljhook := logRotaterConfigs()
 	// Output to console and log file
-	output := zerolog.MultiLevelWriter(ljhook, zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC1123})
+	//output := zerolog.MultiLevelWriter(ljhook, zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC1123})
 
 	// Output to log file only
 	// output := zerolog.MultiLevelWriter(ljhook)
 
 	// Output to console only
-	//_ = ljhook
-	// output := zerolog.MultiLevelWriter(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC1123})
+	_ = ljhook
+	output := zerolog.MultiLevelWriter(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC1123})
 
 	// Create a logger instance that includes the timestamp and caller.
 	// Note: The caller was modified inside of the globals.go file to only include the file name and line number.
@@ -1928,7 +1928,7 @@ func holdingAgentForever() {
 func startGoRoutines(iniData ini.IniConfig, serialNumber string, cmdFlags CMDFlags) {
 	log.Info().Msg("Starting the go routines...")
 
-	// // This is responsible for running and dealing with the "Cymetricx Recovery" service that runs next to "Cyemtricx agent"
+	// This is responsible for running and dealing with the "Cymetricx Recovery" service that runs next to "Cyemtricx agent"
 	// if err := handleCymetricxRecoveryServiceStatus(cmdFlags); err != nil {
 	// 	// We don't to break out of the for loop if the cymetricx recovery failed to run because we care more about the
 	// 	// cymetricx agent itself to be running But we would still want to log it in the logs to check why that happened
@@ -4145,7 +4145,7 @@ func getPublicIP() *string {
 	}
 
 	// Send the request using the custom client
-	response, err := client.Get("http://ifconfig.me")
+	response, err := client.Get("http://ifconfig.me/ip")
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to get IP from ifconfig.me.")
 		return nil
@@ -5602,18 +5602,37 @@ func getAndCompressAndUploadLocalDNS() error {
 // getAllInstalledApplications returns a string of all installed applications on the machine
 // and the installed applications for the current user.
 func getAllInstalledApplicationsV2() (string, error) {
+
+	installedApplications, err := getSingleOrAllInstalledApplicationsV2(nil)
+	if err != nil {
+		return "", fmt.Errorf("error getting all installed applications: %w", err)
+	}
+
+	jsonOutput, err := json.Marshal(installedApplications)
+	if err != nil {
+		return "", err
+	}
+
+	return string(jsonOutput), nil
+
+}
+
+// getSingleOrAllInstalledApplications returns a slice of installed applications on the machine
+// and the installed applications for the current user.
+// If applicationName is empty, it returns all installed applications.
+// If applicationName is not nil, it returns the installed application that matches the DisplayName.
+func getSingleOrAllInstalledApplicationsV2(applicationName *string) ([]ApplicationInfo, error) {
 	userID, err := getWindowsUserIDV2()
 	if err != nil {
-		return "", fmt.Errorf("error getting user ID: %w", err)
+		return nil, fmt.Errorf("error getting Windows user ID: %w", err)
 	}
 
-	installedApplicationsForUser, err := getInstalledApplicationsForAllAndCurrentUserV2(userID)
+	installedApplicationsForUser, err := getInstalledApplicationsForAllAndCurrentUserV2(userID, applicationName)
 	if err != nil {
-		return "", fmt.Errorf("error getting installed applications for user: %w", err)
+		return nil, fmt.Errorf("error getting installed applications for the current user: %w", err)
 	}
 
-	return string(installedApplicationsForUser), nil
-
+	return installedApplicationsForUser, nil
 }
 
 // getWindowsUserID returns the user ID of the current user (not the agent ID)
@@ -5636,6 +5655,8 @@ func getWindowsUserIDV2() (string, error) {
 
 	// Convert SID to string.
 	sidString := user.User.Sid.String()
+
+	log.Info().Msgf("User SID: %s", sidString)
 
 	return sidString, nil
 }
@@ -5667,7 +5688,7 @@ func getIntegerValueOr(k registry.Key, name string, defaultValue uint64) uint64 
 	return val
 }
 
-func getInstalledApplicationsForAllAndCurrentUserV2(userID string) (string, error) {
+func getInstalledApplicationsForAllAndCurrentUserV2(userID string, applicationName *string) ([]ApplicationInfo, error) {
 	// Adjust the keys slice to include user-specific paths using the userID (SID)
 	keys := []struct {
 		baseKey       registry.Key
@@ -5696,11 +5717,11 @@ func getInstalledApplicationsForAllAndCurrentUserV2(userID string) (string, erro
 		if err != nil {
 			continue // Skip if the key cannot be opened
 		}
+		defer k.Close()
 
 		subKeyNames, err := k.ReadSubKeyNames(-1)
 		if err != nil {
-			k.Close()
-			return "", err
+			return nil, fmt.Errorf("error reading subkey names for %s: %w", key.baseKeyString, err)
 		}
 
 		for _, subKeyName := range subKeyNames {
@@ -5708,10 +5729,10 @@ func getInstalledApplicationsForAllAndCurrentUserV2(userID string) (string, erro
 			if err != nil {
 				continue // Skip if the subkey cannot be opened
 			}
+			defer sk.Close()
 
 			displayName, _, err := sk.GetStringValue("DisplayName")
 			if err != nil || displayName == "" {
-				sk.Close()
 				continue // Skip if DisplayName is missing
 			}
 
@@ -5735,21 +5756,18 @@ func getInstalledApplicationsForAllAndCurrentUserV2(userID string) (string, erro
 					PSPath:         fmt.Sprintf("%s\\%s\\%s", key.baseKeyString, key.subKey, subKeyName),
 				}
 
+				// If applicationName is not nil, return the application that matches the DisplayName
+				if applicationName != nil && displayName == *applicationName {
+					return []ApplicationInfo{app}, nil
+				}
+
 				applications = append(applications, app)
 				seen[uniqueKey] = struct{}{} // Mark this application as seen
 			}
-
-			sk.Close()
 		}
-		k.Close()
 	}
 
-	jsonOutput, err := json.Marshal(applications)
-	if err != nil {
-		return "", err
-	}
-
-	return string(jsonOutput), nil
+	return applications, nil
 
 }
 
@@ -7617,18 +7635,13 @@ func checkIfChromeInstalledAndGetItsVersion() (string, error) {
 }
 
 func getChromeVersion() (string, error) {
-	// Get the version of Google Chrome
-	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Google\Chrome\BLBeacon`, registry.QUERY_VALUE)
+	applicationName := "Google Chrome"
+	application, err := getSingleOrAllInstalledApplicationsV2(&applicationName)
 	if err != nil {
-		return "", fmt.Errorf("failed to open registry key: %w", err)
+		return "", fmt.Errorf("failed to get the version of Google Chrome: %w", err)
 	}
-	defer key.Close()
 
-	// Read the version value (stored as a string)
-	version, _, err := key.GetStringValue("version")
-	if err != nil {
-		return "", fmt.Errorf("failed to get version value for Google Chrome: %w", err)
-	}
+	version := *application[0].DisplayVersion
 
 	return version, nil
 }
@@ -7648,17 +7661,13 @@ func checkIfEdgeInstalledAndGetItsVersion() (string, error) {
 }
 
 func getEdgeVersion() (string, error) {
-	// Get the version of Microsoft Edge
-	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Edge\BLBeacon`, registry.QUERY_VALUE)
+	applicationName := "Microsoft Edge"
+	application, err := getSingleOrAllInstalledApplicationsV2(&applicationName)
 	if err != nil {
-		return "", fmt.Errorf("failed to open registry key: %w", err)
+		return "", fmt.Errorf("failed to get the version of Microsoft Edge: %w", err)
 	}
 
-	// Read the version value (stored as a string)
-	version, _, err := key.GetStringValue("version")
-	if err != nil {
-		return "", fmt.Errorf("failed to get version value for Microsoft Edge: %w", err)
-	}
+	version := *application[0].DisplayVersion
 
 	return version, nil
 }
