@@ -49,3 +49,5 @@ configCymetricxAgent.json
 cymetricxAgentFiles
 Compressed Files
 Cymetricx Agent Files
+
+*.json

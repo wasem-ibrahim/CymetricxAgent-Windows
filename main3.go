@@ -1,18 +1,48 @@
 package main
 
-func main3() {
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/rs/zerolog/log"
+)
+
+func main() {
 
 	// Simulate getting JSON data from server
-	// jsonData := getJSONData()
+	jsonData := getJSONData()
 
 	// Process the JSON data
-	// jsonDataOutput := processControlsData(jsonData, "System Controls")
+	var controlsProgress ControlsProgress
+	var combinedJsonDataOutput []byte
+
+	for {
+		// Process controls for a 10-second window.
+		jsonDataOutput, updatedProgress, err := processControlsData(jsonData, "IIS", &controlsProgress, 10*time.Second)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Error processing controls data")
+		}
+		controlsProgress = *updatedProgress
+
+		combinedJsonDataOutput = append(combinedJsonDataOutput, jsonDataOutput...)
+
+		if updatedProgress.FinishedControlsCount > 0 {
+			// Upload the JSON output that includes any finished control results.
+			fmt.Println("Uploading JSON output that includes any finished control results")
+		}
+
+		// If there are no more controls to process, exit the loop.
+		if len(controlsProgress.controlsQueue) == 0 && controlsProgress.ActiveProcessCount == 0 {
+			break
+		}
+	}
 
 	// Export it to a file
-	// err := os.WriteFile("output.json", jsonDataOutput, 0644)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
+	err := os.WriteFile("output.json", combinedJsonDataOutput, 0644)
+	if err != nil {
+		panic(err)
+	}
 
 	// jsonDataOutputString := string(jsonDataOutput)
 	// fmt.Println(jsonDataOutputString)
@@ -62,11 +92,11 @@ func getJSONData() string {
 	]`
 
 	// get jsonDat from a json file instead. Open a file called txt.json and get the data from it
-	// jsonDataBytes, err := os.ReadFile("testIIS.json")
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
+	jsonDataBytes, err := os.ReadFile(`iis-controls-input.json`)
+	if err != nil {
+		panic(err)
+	}
 
-	// jsonData = string(jsonDataBytes)
+	jsonData = string(jsonDataBytes)
 	return jsonData
 }

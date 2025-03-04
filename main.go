@@ -203,7 +203,7 @@ var minimalMonitoringInterval = 10 // In minutes (10 minutes)
 var maximalMonitoringInterval = 15 // In minutes (20 minutes)
 var timeUSN = 60                   // In minutes (60 minutes)
 
-func main() {
+func main1() {
 
 	// Catch any panic and logs it with its stack trace.
 	defer catchAndRestartPanicForFunction(main)
@@ -367,7 +367,6 @@ func catchPanic() {
 
 	// Recover from panic
 	if r := recover(); r != nil {
-
 		// Create a buffer with a size of 1024 bytes to hold the stack trace
 		stackTrace := make([]byte, 1024)
 		for {
@@ -394,6 +393,7 @@ func catchPanic() {
 		// using Err()
 		log.Error().Msgf("Panic recovered and logged with stack trace: %v", err)
 	}
+
 }
 
 // logError logs the error at the end of the function execution if it exists.
@@ -13578,7 +13578,7 @@ func processThen(thenBlock map[string]interface{}, variables map[string]string, 
 			items = []interface{}{v}
 		default:
 			// Handle the case where custom_item is not the expected type
-			fmt.Println("Unexpected type for custom_item")
+			log.Error().Msgf("Unexpected type for custom_item that is value is %v and type is %T", customItems, v)
 			return nil, false
 		}
 
@@ -13616,7 +13616,7 @@ func processThen(thenBlock map[string]interface{}, variables map[string]string, 
 
 	// Check if "if" block exists and process it
 	if ifBlock, ok := thenBlock["if"]; ok {
-		ifBlockResult, ifReport := processIfBlock(ifBlock.(map[string]interface{}), variables, handlers, controlResultList, automatedValue, benchmarkType)
+		ifBlockResult, ifReport := processIfBlock(ifBlock, variables, handlers, controlResultList, automatedValue, benchmarkType)
 		thenBlock["if"] = ifBlockResult
 		return thenBlock, ifReport
 	}
@@ -13625,12 +13625,40 @@ func processThen(thenBlock map[string]interface{}, variables map[string]string, 
 	return nil, false
 }
 
-// Process "if" block
-// Process "if" block
-func processIfBlock(ifBlock map[string]interface{}, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), controlResultList *[]interface{}, automatedValue *string, benchmarkType string) (map[string]interface{}, bool) {
+func processIfBlock(ifBlock interface{}, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), controlResultList *[]interface{}, automatedValue *string, benchmarkType string) ([]map[string]interface{}, bool) {
+	// The value of ifBLock can be a single object or a list of objects
+	var ifBlockList []map[string]interface{}
+	switch v := ifBlock.(type) {
+	case map[string]interface{}:
+		ifBlockList = []map[string]interface{}{v}
+	case []interface{}:
+		for _, item := range v {
+			ifBlockList = append(ifBlockList, item.(map[string]interface{}))
+		}
+	default:
+		log.Error().Msgf("Unexpected type for ifBlock: value=%v, type=%T", ifBlock, v)
+		return nil, false
+	}
+
+	// Process each ifBlock
+	var processedBlocks []map[string]interface{}
+	var finalThenReport bool
+	for _, ifBlock := range ifBlockList {
+		processedBlock, thenReport := processSingleIfBlock(ifBlock, variables, handlers, controlResultList, automatedValue, benchmarkType)
+		if processedBlock != nil {
+			processedBlocks = append(processedBlocks, processedBlock)
+			finalThenReport = finalThenReport || thenReport
+		}
+	}
+
+	return processedBlocks, finalThenReport
+}
+
+func processSingleIfBlock(ifBlock map[string]interface{}, variables map[string]string, handlers map[string]func(map[string]string, map[string]string) (map[string]string, error), controlResultList *[]interface{}, automatedValue *string, benchmarkType string) (map[string]interface{}, bool) {
 	condition := ifBlock["condition"].(map[string]interface{})
 	conditionResult, autoKeyValue, pass := processCondition(condition, variables, handlers, controlResultList, automatedValue, benchmarkType)
 	ifBlock["condition"] = conditionResult
+
 	if pass {
 		thenBlockResult, thenReport := processThen(ifBlock["then"].(map[string]interface{}), variables, handlers, controlResultList, true, automatedValue, autoKeyValue, benchmarkType)
 		ifBlock["then"] = thenBlockResult
@@ -13639,14 +13667,13 @@ func processIfBlock(ifBlock map[string]interface{}, variables map[string]string,
 		elseBlockResult, elseReport := processThen(elseBlock.(map[string]interface{}), variables, handlers, controlResultList, false, automatedValue, autoKeyValue, benchmarkType)
 		ifBlock["else"] = elseBlockResult
 		return ifBlock, elseReport
-	} else if !pass {
-		if _, ok := ifBlock["then"]; ok {
-			thenBlockResult, thenReport := processThen(ifBlock["then"].(map[string]interface{}), variables, handlers, controlResultList, false, automatedValue, autoKeyValue, benchmarkType)
-			ifBlock["then"] = thenBlockResult
-			return ifBlock, thenReport
-		}
+	} else if _, ok := ifBlock["then"]; ok {
+		thenBlockResult, thenReport := processThen(ifBlock["then"].(map[string]interface{}), variables, handlers, controlResultList, false, automatedValue, autoKeyValue, benchmarkType)
+		ifBlock["then"] = thenBlockResult
+		return ifBlock, thenReport
 	}
-	return ifBlock, false
+
+	return nil, false
 }
 
 // Process a single control using handlers
@@ -13720,7 +13747,10 @@ func processControlsData(jsonData, benchmarkType string, progress *ControlsProgr
 	}
 
 	// Process controls within the given timeout.
-	finishedResults := processControlsWithinTimeout(benchmarkType, progress, timeout)
+	finishedResults, err := processControlsWithinTimeout(benchmarkType, progress, timeout)
+	if err != nil {
+		return nil, progress, err
+	}
 
 	// Build the output JSON.
 	jsonOutput, err := buildControlsOutput(progress, finishedResults)
@@ -13766,10 +13796,11 @@ func initializeControlsQueue(jsonData string, progress *ControlsProgress) error 
 	return nil
 }
 
-func processControlsWithinTimeout(benchmarkType string, progress *ControlsProgress, timeout time.Duration) []interface{} {
+func processControlsWithinTimeout(benchmarkType string, progress *ControlsProgress, timeout time.Duration) ([]interface{}, error) {
 	var finishedResults []interface{}
 	deadline := time.Now().Add(timeout)
 	resultChan := progress.ResultChan
+	errorChan := make(chan error, 1) // Buffered to avoid blocking
 
 deadlineLoop:
 	for time.Now().Before(deadline) {
@@ -13782,6 +13813,24 @@ deadlineLoop:
 
 			// Lfaunch the control in its own goroutine.
 			go func(ctrl controlWithVars) {
+				// The recover() call must be placed directly inside this deferred function
+				// to catch any panic that occurs in this goroutine. Nesting it inside another
+				// function will prevent it from catching the panic.
+				defer func() {
+					if r := recover(); r != nil {
+						stackTrace := make([]byte, 1024)
+						for {
+							n := runtime.Stack(stackTrace, false)
+							if n < len(stackTrace) {
+								stackTrace = stackTrace[:n]
+								break
+							}
+							stackTrace = make([]byte, len(stackTrace)*2)
+						}
+						err := fmt.Errorf("%v\nStack Trace:\n%s", r, stackTrace)
+						errorChan <- err // Send the error to the error channel.
+					}
+				}()
 				// processControls2 returns a slice; here we take the first element.
 				res := processControls(ctrl.control, getControlHandlers(), ctrl.variables, benchmarkType)
 				resultChan <- res[0]
@@ -13819,11 +13868,13 @@ deadlineLoop:
 		case res := <-resultChan:
 			finishedResults = append(finishedResults, res)
 			progress.ActiveProcessCount--
+		case err := <-errorChan:
+			return nil, err
 		case <-time.After(remaining):
 			break deadlineLoop
 		}
 	}
-	return finishedResults
+	return finishedResults, nil
 }
 
 func buildControlsOutput(progress *ControlsProgress, finishedResults []interface{}) ([]byte, error) {
