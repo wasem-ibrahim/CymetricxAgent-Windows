@@ -203,7 +203,7 @@ var minimalMonitoringInterval = 10 // In minutes (10 minutes)
 var maximalMonitoringInterval = 15 // In minutes (20 minutes)
 var timeUSN = 60                   // In minutes (60 minutes)
 
-func main1() {
+func main() {
 
 	// Catch any panic and logs it with its stack trace.
 	defer catchAndRestartPanicForFunction(main)
@@ -13694,6 +13694,8 @@ func processSingleControl(control map[string]string, variables map[string]string
 			}
 			returnedMap["Exception"] = ""
 			returnedMap["automated"] = "true"
+
+			log.Debug().Msgf("Successfully processed control for %s with key %s and type %s", benchmarkType, controlKey, objType)
 			return returnedMap
 		} else {
 			log.Warn().Msg("No handler for type: " + objType)

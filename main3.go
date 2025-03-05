@@ -8,7 +8,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-func main() {
+func main3() {
 
 	// Simulate getting JSON data from server
 	jsonData := getJSONData()
