@@ -8935,7 +8935,7 @@ func executeFeatureFunctions(configs []FeatureFunctionConfig) map[string]string 
 		if config.Toggle {
 			rawData, err := config.Func()
 			if err != nil {
-				log.Error().Err(err).Msg("Error executing feature function.")
+				log.Error().Err(err).Msgf("Error executing feature function for result key %s", config.ResultKey)
 				continue
 			}
 			if config.ResultKey == "getnetshare" {
