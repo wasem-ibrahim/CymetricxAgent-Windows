@@ -17,6 +17,7 @@ import (
 	"cymetricx/ldb"
 	"database/sql"
 	b64 "encoding/base64"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -54,10 +55,10 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/rs/zerolog/pkgerrors"
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/disk"
-	"github.com/shirou/gopsutil/process"
-	"github.com/shirou/gopsutil/v3/mem"
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/shirou/gopsutil/v4/mem"
+	"github.com/shirou/gopsutil/v4/process"
 
 	"github.com/yusufpapurcu/wmi"
 	"golang.org/x/sys/windows"
@@ -190,7 +191,7 @@ var apiURLLaravel = "" //"https://157.175.205.169/cymetricx_api/" // Cloud one
 // by multiple goroutines.
 var client = createInsecureHttpClient()
 
-const AgentVersion = "4.9.26"
+const AgentVersion = "4.9.33"
 
 const CymetricxPath = "C:\\Program Files\\CYMETRICX"
 
@@ -1928,7 +1929,7 @@ func holdingAgentForever() {
 func startGoRoutines(iniData ini.IniConfig, serialNumber string, cmdFlags CMDFlags) {
 	log.Info().Msg("Starting the go routines...")
 
-	// This is responsible for running and dealing with the "Cymetricx Recovery" service that runs next to "Cyemtricx agent"
+	// //This is responsible for running and dealing with the "Cymetricx Recovery" service that runs next to "Cyemtricx agent"
 	// if err := handleCymetricxRecoveryServiceStatus(cmdFlags); err != nil {
 	// 	// We don't to break out of the for loop if the cymetricx recovery failed to run because we care more about the
 	// 	// cymetricx agent itself to be running But we would still want to log it in the logs to check why that happened
@@ -6955,6 +6956,84 @@ func runCyscanAndUploadItsOutput(jsonFileContent string) (err error) {
 	return nil
 }
 
+func runDDAScanAndUploadItsOutput(scanID int) (err error) {
+	defer catchPanic()
+
+	defer logError(&err, "Error in runDDAScanAndUploadItsOutput")
+
+	if err := fetchAndSaveDDAConfigurations(scanID); err != nil {
+		return err
+	}
+
+	go monitorProgressFileAndUploadProgress(scanID)
+
+	ddaPath := filepath.Join(CymetricxPath, "dda.exe")
+	if err := execCommandWithoutOutput(cmdPath, "/c", ddaPath); err != nil {
+		return fmt.Errorf("error in executing cyscan command: %w", err)
+	}
+
+	if err := collectDDADBDataAndCompressAndUploadIt(scanID); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func fetchAndSaveDDAConfigurations(scanID int) error {
+	apiEndPoint := fmt.Sprintf("data-discovery/get-configuration/%s/%d", id, scanID)
+	configurationsJson, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("GET", apiEndPoint, nil, 10)
+	if err != nil {
+		return fmt.Errorf("error in getting configurations for DDA scan: %w", err)
+	}
+
+	// Create the json file that the cyscan will use.
+	jsonFilePath := filepath.Join(CymetricxPath, "dda-configurations.json")
+	if err = createFileWithPermissionsAndWriteToIt(jsonFilePath, configurationsJson.String(), 0644); err != nil {
+		return fmt.Errorf("error in creating file and writing to it: %w", err)
+	}
+	return nil
+}
+
+func monitorProgressFileAndUploadProgress(scanID int) {
+	defer catchPanic()
+
+	var lastModTime time.Time
+	filePath := filepath.Join(CymetricxPath, "dda-progress.json")
+
+	for {
+		// Wait for 3 minutes before checking again.
+		// This also gives time for the file to be created if it doesn't exist.
+		time.Sleep(3 * time.Minute)
+
+		// Check the file stats of progress.json.
+		if !fileExists(filePath) {
+			// File not found, wait for it to be created.
+			continue
+		}
+
+		// Get the file info and check for modification time.
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			log.Error().Err(err).Msg("Error getting file info for dda-progress.json")
+			continue
+		}
+
+		// Compare modification time of the file.
+		modTime := fileInfo.ModTime()
+		if modTime.Before(lastModTime) || modTime.Equal(lastModTime) {
+			// File has not been modified since the last check.
+			continue
+		}
+
+		lastModTime = modTime // Update the stored modification time.
+		log.Info().Msgf("File %s has been modified from previous modification time %v to %v", filePath, lastModTime, modTime)
+		if err := uploadProgressData(scanID); err != nil {
+			log.Error().Err(err).Msg("Error uploading progress data")
+			continue
+		}
+	}
+}
+
 // collectCyscanDBDataAndCompressAndUploadItV2 compresses the cyscan DB after writing it to CSV files and uploads it to the server after zipping it
 func collectCyscanDBDataAndCompressAndUploadItV2() error {
 	log.Info().Msg("Starting compression and upload process for Cyscan DB.")
@@ -6990,6 +7069,259 @@ func collectCyscanDBDataAndCompressAndUploadItV2() error {
 	log.Info().Msg("Successfully executed the upload request for Cyscan DB.")
 
 	return nil
+}
+
+func collectDDADBDataAndCompressAndUploadIt(scanID int) error {
+	if err := compressAndUploadSensitiveData(scanID); err != nil {
+		return err
+	}
+
+	if err := uploadProgressData(scanID); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func compressAndUploadSensitiveData(scanID int) error {
+	log.Info().Msg("Starting sensitive data CSV compression and upload process for DDA DB.")
+
+	// Retrieve sensitive data as CSV.
+	sensitiveDataCSVPath, err := getSenstiveDataTableAsCSVFromDDADB()
+	if err != nil {
+		return fmt.Errorf("error while getting sensitive data table as CSV from DDA DB: %w", err)
+	}
+
+	// Construct zip filename and file path.
+	zipFileName := fmt.Sprintf("dda_%s.zip", id)
+	zipFilePath := filepath.Join(CymetricxPath, "Compressed Files", zipFileName)
+	sensitiveDataCSVDestinationName := fmt.Sprintf("dda_%s_sensitive_data.csv", id)
+
+	// Map source file to destination inside the zip (here we keep the same name).
+	srcToDstMap := map[string]string{
+		sensitiveDataCSVPath: sensitiveDataCSVDestinationName,
+	}
+
+	// Create and write the zip file.
+	if err := createAndWriteToZipFile(zipFileName, srcToDstMap); err != nil {
+		return fmt.Errorf("error in creating and writing to zip file: %w", err)
+	}
+
+	// Build endpoint for uploading the file.
+	scanResultEndPoint := fmt.Sprintf("data-discovery/store-scan-result/%s/%d", id, scanID)
+	responseBody, err := createAndExecuteFileUploadRequest(scanResultEndPoint, zipFilePath)
+	if err != nil {
+		return fmt.Errorf("error in creating and executing file upload request: %w", err)
+	}
+
+	// Check the upload response.
+	if err := readGeneralReponseBody(responseBody); err != nil {
+		return fmt.Errorf("error in uploading DDA sensitive data CSV: %w", err)
+	}
+
+	return nil
+}
+
+func uploadProgressData(scanID int) error {
+	log.Info().Msg("Starting progress JSON upload process for DDA DB.")
+
+	// Retrieve progress data as JSON.
+	progressJSON, err := getProgressTableAsJsonFromDDADB()
+	if err != nil {
+		return fmt.Errorf("error while getting progress table as JSON from DDA DB: %w", err)
+	}
+
+	// Build endpoint for uploading progress data.
+	scanProgressEndPoint := fmt.Sprintf("data-discovery/store-scan-progress/%s/%d", id, scanID)
+	responseBody, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", scanProgressEndPoint, progressJSON, 10)
+	if err != nil {
+		return fmt.Errorf("error in sending scan progress: %w", err)
+	}
+
+	// Check the upload response.
+	if err := readGeneralReponseBody(responseBody); err != nil {
+		return fmt.Errorf("error in uploading DDA scan progress: %w", err)
+	}
+
+	return nil
+}
+
+func getSenstiveDataTableAsCSVFromDDADB() (string, error) {
+	dbPath := filepath.Join(CymetricxPath, "dda.db")
+	tableName := "SensitiveData"
+	sensitiveDataCSVPath := filepath.Join(CymetricxPath, "sensitive-data.csv")
+
+	sensitiveDataCSVPath, err := exportTableToCSV(dbPath, tableName, sensitiveDataCSVPath)
+	if err != nil {
+		return "", fmt.Errorf("error exporting table SensitiveData to CSV: %w", err)
+	}
+
+	return sensitiveDataCSVPath, nil
+}
+
+func getProgressTableAsJsonFromDDADB() ([]byte, error) {
+	progressJSONPath := filepath.Join(CymetricxPath, "dda-progress.json")
+
+	jsonContent, err := os.ReadFile(progressJSONPath)
+	if err != nil {
+		return nil, fmt.Errorf("error reading dda-progress.json file: %w", err)
+	}
+
+	jsonContent = bytes.TrimSpace(jsonContent)
+
+	return jsonContent, nil
+}
+
+// exportTableToCSV opens an SQLite3 database from dbPath, queries all rows from tableName,
+// writes the results to a CSV file at csvPath, and returns the CSV file path.
+func exportTableToCSV(dbPath string, tableName string, csvPath string) (string, error) {
+	// Open the SQLite3 database.
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open database: %w", err)
+	}
+	defer db.Close()
+
+	// Build the query for selecting all rows from the given table.
+	query := fmt.Sprintf("SELECT * FROM %s", tableName)
+	rows, err := db.Query(query)
+	if err != nil {
+		return "", fmt.Errorf("failed to run query: %w", err)
+	}
+	defer rows.Close()
+
+	// Open/Create the CSV file.
+	file, err := os.Create(csvPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create csv file: %w", err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// Retrieve column names for the header.
+	columns, err := rows.Columns()
+	if err != nil {
+		return "", fmt.Errorf("failed to get columns: %w", err)
+	}
+
+	// Write the header row (column names) to the CSV file.
+	if err := writer.Write(columns); err != nil {
+		return "", fmt.Errorf("error writing header to csv: %w", err)
+	}
+
+	// Prepare containers to hold row data.
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	// Iterate over all rows.
+	for rows.Next() {
+		// Populate the slice with data from the row.
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return "", fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		// Prepare a record for the CSV file.
+		record := make([]string, len(columns))
+		for i, val := range values {
+			// Convert each value to a string.
+			if val != nil {
+				record[i] = fmt.Sprintf("%v", val)
+			} else {
+				record[i] = ""
+			}
+		}
+
+		// Write the record (row) to the CSV.
+		if err := writer.Write(record); err != nil {
+			return "", fmt.Errorf("error writing record to csv: %w", err)
+		}
+	}
+
+	// Check for any error encountered during iteration.
+	if err = rows.Err(); err != nil {
+		return "", fmt.Errorf("rows iteration error: %w", err)
+	}
+
+	// Return the CSV file path.
+	return csvPath, nil
+}
+
+// exportTableToJSON opens an SQLite3 database from dbPath, queries all rows from tableName,
+// writes the results into a JSON file at jsonPath, and returns the JSON file path.
+func exportTableToJSON(dbPath string, tableName string, jsonPath string) (string, error) {
+	// Open the SQLite3 database.
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open database: %w", err)
+	}
+	defer db.Close()
+
+	// Build the query for selecting all rows from the table.
+	query := fmt.Sprintf("SELECT * FROM %s", tableName)
+	rows, err := db.Query(query)
+	if err != nil {
+		return "", fmt.Errorf("failed to run query: %w", err)
+	}
+	defer rows.Close()
+
+	// Retrieve column names for constructing each row's map.
+	columns, err := rows.Columns()
+	if err != nil {
+		return "", fmt.Errorf("failed to get columns: %w", err)
+	}
+
+	// Prepare a slice to hold all rows as maps.
+	var results []map[string]interface{}
+
+	// Create containers for row data.
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	// Iterate over rows.
+	for rows.Next() {
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return "", fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		// Create a map for this row to hold column name to value.
+		rowMap := make(map[string]interface{})
+		for i, colName := range columns {
+			// If the value is nil, leave it as nil; otherwise, assign the value.
+			rowMap[colName] = values[i]
+		}
+
+		results = append(results, rowMap)
+	}
+
+	// Check for iteration errors.
+	if err = rows.Err(); err != nil {
+		return "", fmt.Errorf("rows iteration error: %w", err)
+	}
+
+	// Create the JSON file.
+	file, err := os.Create(jsonPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create JSON file: %w", err)
+	}
+	defer file.Close()
+
+	// Write the JSON-encoded data to file.
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ") // Optional: prettify the JSON output.
+	if err := encoder.Encode(results); err != nil {
+		return "", fmt.Errorf("failed to encode JSON: %w", err)
+	}
+
+	// Return the path of the JSON file.
+	return jsonPath, nil
 }
 
 type CyscanResult struct {
@@ -8935,7 +9267,7 @@ func executeFeatureFunctions(configs []FeatureFunctionConfig) map[string]string 
 		if config.Toggle {
 			rawData, err := config.Func()
 			if err != nil {
-				log.Error().Err(err).Msgf("Error executing feature function for result key %s", config.ResultKey)
+				log.Error().Err(err).Msg("Error executing feature function.")
 				continue
 			}
 			if config.ResultKey == "getnetshare" {
@@ -9384,7 +9716,6 @@ func getCPUStats() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("error in cpu.Counts: %w", err)
 	}
-
 	cpuUtilization, err := cpu.Percent(time.Second, false)
 	if err != nil {
 		return "", fmt.Errorf("error in cpu.Percent: %w", err)
@@ -10183,33 +10514,46 @@ func getWindowsDisplayVersion() (string, error) {
 func getAllWindowsServicesStatus() (string, error) {
 
 	script := `
-	# Retrieve information about services and format it
-	$ServiceInfoText = Get-Service | Format-List -Property DisplayName, Name, Status | Out-String
+		# Retrieve information about services and format it
+		$ServiceInfoText = Get-Service | Format-List -Property DisplayName, Name, Status | Out-String
 
-	# Define a regular expression pattern to match the lines containing service information
-	$Pattern = "DisplayName\s*:\s*(?<DisplayName>.+)\s*Name\s*:\s*(?<Name>.+)\s*Status\s*:\s*(?<Status>.+)"
+		# Define a regular expression pattern to match the lines containing service information
+		$Pattern = "DisplayName\s*:\s*(?<DisplayName>.+)\s*Name\s*:\s*(?<Name>.+)\s*Status\s*:\s*(?<Status>.+)"
 
-	# Extract matches from the text using the regular expression pattern
-	$Matches = $ServiceInfoText | Select-String -Pattern $Pattern -AllMatches | ForEach-Object { $_.Matches }
+		# Extract matches from the text using the regular expression pattern
+		$Matches = $ServiceInfoText | Select-String -Pattern $Pattern -AllMatches | ForEach-Object { $_.Matches }
 
-	# Create custom objects from the extracted matches
-	$ServiceInfoObjects = $Matches | ForEach-Object {
-		[PSCustomObject]@{
-			DisplayName = $_.Groups["DisplayName"].Value.Trim()
-			Name = $_.Groups["Name"].Value.Trim()
-			Status = $_.Groups["Status"].Value.Trim()
+		# Create custom objects from the extracted matches
+		$ServiceInfoObjects = $Matches | ForEach-Object {
+			New-Object PSObject -Property @{
+				DisplayName = $_.Groups["DisplayName"].Value.Trim()
+				Name = $_.Groups["Name"].Value.Trim()
+				Status = $_.Groups["Status"].Value.Trim()
+			}
 		}
-	}
 
-	# Convert the custom objects to minified JSON format
-	# $ServiceInfoJson = $ServiceInfoObjects | ConvertTo-Json -Compress
-	$ServiceInfoObjects | ConvertTo-Json -Compress
+		# PowerShell 3+ JSON conversion
+		if (Get-Command ConvertTo-Json -ErrorAction SilentlyContinue) {
+			$ServiceInfoJson = $ServiceInfoObjects | ConvertTo-Json -Compress
+		} else {
+			# PowerShell 2.0 JSON conversion fallback
+			function Convert-To-Json-PS2 ($obj) {
+				if (!$obj -or $obj.Count -eq 0) { return "[]" }
 
-	# Specify the path to the output JSON file
-	# $jsonFilePath = 'C:\Program Files\CYMETRICX\service_info.json'
+				$jsonObjects = foreach ($item in $obj) {
+					$props = $item.PSObject.Properties | ForEach-Object {
+						'"' + $_.Name + '":"' + ($_.Value -replace '\\', '\\' -replace '"', '"') + '"'
+					}
+					'{' + ($props -join ',') + '}'
+				}
+				'[' + ($jsonObjects -join ',') + ']'
+			}
+			$ServiceInfoJson = Convert-To-Json-PS2 $ServiceInfoObjects 
+		}
 
-	# Write the minified JSON data to the output file
-	# $ServiceInfoJson | Out-File -FilePath $jsonFilePath -Encoding UTF8
+		# Output JSON
+		$ServiceInfoJson 
+	
 	`
 
 	// output, err := createAndRunPS1FileWithOutput("GetService.ps1", "Get-Service | Format-List -Property DisplayName,Name,Status")
@@ -10273,17 +10617,38 @@ func getAllScheduledTasksInfo() (string, error) {
 
 	// script := "Get-ScheduledTask | select TaskName,Author,State,date,Description,PSComputerName,URI,TaskPath,'####fortress####'"
 	script := `
-# Retrieve information about scheduled tasks and select specific properties
-$ScheduledTasks = Get-ScheduledTask | Select-Object TaskName, Author, State, LastRunTime, Description, PSComputerName, URI, TaskPath
-
-# Convert it to minified JSON format
-$ScheduledTasks | ConvertTo-Json -Depth 10 -Compress
-
-# Specify the path to the output JSON file
-# $jsonFilePath = 'C:\Program Files\CYMETRICX\scheduled_tasks.json'
-
-# Convert the scheduled tasks to minified JSON format and write it to the output file
-# $ScheduledTasks | ConvertTo-Json -Depth 10 -Compress | Out-File -FilePath $jsonFilePath -Encoding UTF8
+	# Retrieve scheduled tasks with specific properties
+	try {
+		$ScheduledTasks = Get-ScheduledTask | Select-Object TaskName, Author, State, LastRunTime, Description, PSComputerName, URI, TaskPath
+	} catch {
+		# Fallback to schtasks (PowerShell 2.0 compatibility)
+		$ScheduledTasks = schtasks /query /fo csv /v | ConvertFrom-Csv | Select-Object TaskName, Author, State, LastRunTime, Description, PSComputerName, URI, TaskPath
+	}
+	
+	# Convert output to JSON
+	try {
+		$JsonOutput = $ScheduledTasks | ConvertTo-Json -Depth 10 -Compress
+	} catch {
+		function Convert-To-Json-PS2 ($obj) {
+			if (-not $obj -or $obj.Count -eq 0) { return "" }
+	
+			$jsonItems = foreach ($item in $obj) {
+				$properties = foreach ($prop in $item.PSObject.Properties) {
+					$name  = $prop.Name
+					$value = if ($prop.Value -ne $null) { $prop.Value.ToString() } else { "" }
+					$escapedValue = $value -replace '\\', '\\' -replace '"', '"'
+					'"{0}":"{1}"' -f $name, $escapedValue
+				}
+				'{' + ($properties -join ',') + '}'
+			}
+			return '[' + ($jsonItems -join ',') + ']'
+		}
+		$JsonOutput = Convert-To-Json-PS2 $ScheduledTasks
+	}
+	
+	# Output JSON
+	$JsonOutput
+	
 	
 	`
 	output, err := createAndRunPS1FileWithOutput("getwinScheduledTask.ps1", script)
@@ -10324,53 +10689,171 @@ func getSecureBootStatus() (string, error) {
 
 func getNetworkInterfaceInfo() (string, error) {
 	script := `
-	# Get network interface configurations
-	$NetIPConfigurations = Get-NetIPConfiguration -All
-
-	# Get network interfaces
-	$NetIPInterfaces = Get-NetIPInterface
-
-	# Get network adapters for additional properties like InterfaceDescription
-	$NetAdapters = Get-NetAdapter
-
-	# Combine information from both commands
-	$CombinedInfo = foreach ($interface in $NetIPInterfaces) {
-		$config = $NetIPConfigurations | Where-Object { $_.InterfaceIndex -eq $interface.ifIndex }
-		$adapter = $NetAdapters | Where-Object { $_.InterfaceIndex -eq $interface.ifIndex }
 		
-		# Extracting IPv4 and IPv6 addresses
-		$IPv4Address = $config.IPv4Address.IPAddress
-		$IPv6Address = $config.IPv6Address.IPAddress
-		$IPv4Gateway = $config.IPv4DefaultGateway.NextHop
-		$IPv6Gateway = $config.IPv6DefaultGateway.NextHop
-		$DNSServer = $config.DNSServer.ServerAddresses -join ','
-	$Status = if ($adapter.Status -eq 'Up' -and $adapter.LinkSpeed -ne '0 bps' -and $adapter.LinkSpeed -ne $null) { 'Connected' } else { 'Disconnected' }
-		$SubnetMask = if ($config.IPv4Address) { Convert-PrefixLengthToSubnetMask -PrefixLength $config.IPv4Address.PrefixLength } else { $null }
-		$SubnetMask = $config.IPv4Address.PrefixLength
-
-	$PolicyStoreValue = $interface.Store
-		[PSCustomObject]@{
-			InterfaceIndex = $interface.ifIndex
-			InterfaceAlias = $interface.InterfaceAlias
-			AddressFamily = $interface.AddressFamily
-			NlMtu = $interface.NlMtu
-			InterfaceMetric = $interface.InterfaceMetric
-			Dhcp = $interface.Dhcp
-			ConnectionState = $Status
-			PolicyStore = $PolicyStoreValue
-			InterfaceDescription = $adapter.InterfaceDescription
-			IPv4Address = $IPv4Address
-			IPv6DefaultGateway = $IPv6Gateway
-			IPv4DefaultGateway = $IPv4Gateway
-			DNSServer = $DNSServer
-			SubnetMask = $SubnetMask
+	# Get PowerShell version
+	
+	
+	# Function to convert Prefix Length (CIDR) to Subnet Mask dynamically
+	function Convert-PrefixLengthToSubnetMask {
+		param ([int]$PrefixLength)
+	
+		if ($PrefixLength -lt 0 -or $PrefixLength -gt 32) {
+			throw "Invalid Prefix Length: $PrefixLength. It must be between 0 and 32."
 		}
+	
+		# Convert PrefixLength to binary mask (32-bit integer)
+		$binaryMask = [math]::Pow(2, 32) - [math]::Pow(2, 32 - $PrefixLength)
+	
+		# Convert to IP Address format
+		$maskBytes = [BitConverter]::GetBytes([UInt32]$binaryMask)
+	
+		# Reverse byte order for correct formatting
+		if ([BitConverter]::IsLittleEndian) {
+			[Array]::Reverse($maskBytes)
+		}
+	
+		return ([System.Net.IPAddress]$maskBytes).ToString()
 	}
-	$CombinedInfo | ConvertTo-Json -Depth 5 -Compress
-	#$jsonOutput = $CombinedInfo | ConvertTo-Json -Depth 5 -Compress
+	
+	if (Get-Command Get-NetIPConfiguration -ErrorAction SilentlyContinue) {
+		# PowerShell 3.0+ (Use Modern Cmdlets)
+		$NetIPConfigurations = Get-NetIPConfiguration -All
+		$NetIPInterfaces = Get-NetIPInterface
+		$NetAdapters = Get-NetAdapter
+	
+		# Combine information
+		$CombinedInfo = foreach ($interface in $NetIPInterfaces) {
+			$config = $NetIPConfigurations | Where-Object { $_.InterfaceIndex -eq $interface.ifIndex }
+			$adapter = $NetAdapters | Where-Object { $_.InterfaceIndex -eq $interface.ifIndex }
+	
+			# Collect multiple IPv4/IPv6 addresses
+			$IPv4Addresses = ($config.IPv4Address.IPAddress -join ',')
+			$IPv6Addresses = ($config.IPv6Address.IPAddress -join ',')
+	
+			[PSCustomObject]@{
+				InterfaceIndex = $interface.ifIndex
+				InterfaceAlias = $interface.InterfaceAlias
+				AddressFamily = if ($IPv4Addresses) { "IPv4" } elseif ($IPv6Addresses) { "IPv6" } else { "N/A" }
+				NlMtu = $interface.NlMtu
+				InterfaceMetric = $interface.InterfaceMetric
+				Dhcp = $interface.Dhcp
+				ConnectionState = if ($adapter.Status -eq 'Up' -and $adapter.LinkSpeed -ne '0 bps' -and $adapter.LinkSpeed -ne $null) { 'Connected' } else { 'Disconnected' }
+				PolicyStore = $interface.Store
+				InterfaceDescription = $adapter.InterfaceDescription
+				IPv4Address = $IPv4Addresses
+				IPv6Address = $IPv6Addresses
+				IPv6DefaultGateway = $config.IPv6DefaultGateway.NextHop
+				IPv4DefaultGateway = $config.IPv4DefaultGateway.NextHop
+				DNSServer = $config.DNSServer.ServerAddresses -join ','
+				SubnetMask = if ($config.IPv4Address) { Convert-PrefixLengthToSubnetMask -PrefixLength $config.IPv4Address.PrefixLength } else { $null }
+			}
+		}
+	} else {
+		# PowerShell 2.0 (Use WMI)
+		# Initialize an empty array
+		$CombinedInfo = @()
+		$NetAdapters = Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true }
+		$AdaptersInfo = Get-WmiObject Win32_NetworkAdapter
+		# Collect network details
+		foreach ($adapter in $NetAdapters) {
+			# Collect all IP addresses
+			$IPv4Addresses = ($adapter.IPAddress | Where-Object { $_ -match "\." }) -join ','
+			$IPv6Addresses = ($adapter.IPAddress | Where-Object { $_ -match ":" }) -join ','
+	
+			$CombinedInfo += [PSCustomObject]@{
+				InterfaceIndex = $adapter.InterfaceIndex
+				InterfaceAlias = $adapter.Description
+				AddressFamily = if ($IPv4Addresses) { "IPv4" } elseif ($IPv6Addresses) { "IPv6" } else { "N/A" }
+				NlMtu = $adapter.MTU
+				InterfaceMetric = $adapter.IPConnectionMetric
+				Dhcp = if ($adapter.DHCPEnabled) { "Enabled" } else { "Disabled" }
+				ConnectionState = if ($adapter.IPEnabled -eq $true) { "Connected" } else { "Disconnected" }
+				PolicyStore = "N/A"  # No equivalent in WMI
+				InterfaceDescription = $adapter.Description
+				IPv4Address = $IPv4Addresses
+				IPv6Address = $IPv6Addresses
+				IPv6DefaultGateway = ($adapter.DefaultIPGateway | Where-Object { $_ -match ":" }) -join ','
+				IPv4DefaultGateway = ($adapter.DefaultIPGateway | Where-Object { $_ -match "\." }) -join ','
+				DNSServer = ($adapter.DNSServerSearchOrder -join ',')
+				SubnetMask = ($adapter.IPSubnet -join ',')
+			}
+		}
+		
+		foreach ($config in $NetAdapters) {
+        $adapter = $AdaptersInfo | Where-Object { $_.Index -eq $config.Index }
 
-	# Optionally, you can export this information to a JSON file
-	# $jsonOutput | Out-File -FilePath "C:\Program Files\CYMETRICX\net_ip_info.json" -Encoding UTF8
+        $AddressFamily = if ($config.IPAddress -match "\\.") { "IPv4" } elseif ($config.IPAddress -match ":") { "IPv6" } else { "Unknown" }
+
+
+        $CombinedInfo +=[PSCustomObject]@{
+          InterfaceIndex       = $config.Index
+          InterfaceAlias       = $adapter.NetConnectionID
+          AddressFamily        = $AddressFamily
+          NlMtu                = $null
+          InterfaceMetric      = $config.IPConnectionMetric
+          Dhcp                 = if ($config.DHCPEnabled) { "True" } else { "False" }
+          ConnectionState      = if ($adapter.NetConnectionStatus -eq 2) { "Connected" } else { "Disconnected" }
+          PolicyStore          = "N/A"
+          InterfaceDescription = $adapter.Description
+          IPv4Address          = ($config.IPAddress | Where-Object {$_ -match "\\."}) -join ','
+          IPv6Address          = ($config.IPAddress | Where-Object {$_ -match ":"}) -join ','
+          IPv4DefaultGateway   = ($config.DefaultIPGateway | Where-Object {$_ -match "\\."}) -join ','
+          IPv6DefaultGateway   = ($config.DefaultIPGateway | Where-Object {$_ -match ":"}) -join ','
+          DNSServer            = ($config.DNSServerSearchOrder -join ',')
+          SubnetMask           = ($config.IPSubnet -join ',')
+        }
+      }
+	}
+	# Convert to JSON with fallback for PowerShell 2.0
+	if (Get-Command ConvertTo-Json -ErrorAction SilentlyContinue) {
+		$jsonOutput = $CombinedInfo | ConvertTo-Json -Depth 5 -Compress
+	} else {
+		# PowerShell 2.0 JSON conversion fallback
+		$jsonObjects = foreach ($item in $CombinedInfo) {
+			# Handle null values properly, defaulting to "N/A" for strings and 0 for numbers
+			$InterfaceIndex = if ($item.InterfaceIndex -ne $null) { $item.InterfaceIndex } else { 0 }
+			$NlMtu = if ($item.NlMtu -ne $null) { $item.NlMtu } else { 0 }
+			$InterfaceMetric = if ($item.InterfaceMetric -ne $null) { $item.InterfaceMetric } else { 0 }
+			$IPv4Address = if ($item.IPv4Address -ne $null) { '"' + $item.IPv4Address + '"' } else { '"N/A"' }
+			$IPv6Address = if ($item.IPv6Address -ne $null) { '"' + $item.IPv6Address + '"' } else { '"N/A"' }
+			$IPv6DefaultGateway = if ($item.IPv6DefaultGateway -ne $null) { '"' + $item.IPv6DefaultGateway + '"' } else { '"N/A"' }
+			$IPv4DefaultGateway = if ($item.IPv4DefaultGateway -ne $null) { '"' + $item.IPv4DefaultGateway + '"' } else { '"N/A"' }
+			$DNSServer = if ($item.DNSServer -ne $null) { '"' + $item.DNSServer + '"' } else { '"N/A"' }
+			$SubnetMask = if ($item.SubnetMask -ne $null) { '"' + $item.SubnetMask + '"' } else { '"N/A"' }
+			$InterfaceAlias = if ($item.InterfaceAlias -ne $null) { '"' + ($item.InterfaceAlias -replace '"', '\"') + '"' } else { '"N/A"' }
+			$AddressFamily = if ($item.AddressFamily -ne $null) { '"' + $item.AddressFamily + '"' } else { '"N/A"' }
+			$Dhcp = if ($item.Dhcp -ne $null) { '"' + $item.Dhcp + '"' } else { '"N/A"' }
+			$ConnectionState = if ($item.ConnectionState -ne $null) { '"' + $item.ConnectionState + '"' } else { '"N/A"' }
+			$PolicyStore = if ($item.PolicyStore -ne $null) { '"' + $item.PolicyStore + '"' } else { '"N/A"' }
+			$InterfaceDescription = if ($item.InterfaceDescription -ne $null) { '"' + ($item.InterfaceDescription -replace '"', '\"') + '"' } else { '"N/A"' }
+	
+			'{' +
+			'"InterfaceIndex":' + $InterfaceIndex + ',' +
+			'"InterfaceAlias":' + $InterfaceAlias + ',' +
+			'"AddressFamily":' + $AddressFamily + ',' +
+			'"NlMtu":' + $NlMtu + ',' +
+			'"InterfaceMetric":' + $InterfaceMetric + ',' +
+			'"Dhcp":' + $Dhcp + ',' +
+			'"ConnectionState":' + $ConnectionState + ',' +
+			'"PolicyStore":' + $PolicyStore + ',' +
+			'"InterfaceDescription":' + $InterfaceDescription + ',' +
+			'"IPv4Address":' + $IPv4Address + ',' +
+			'"IPv6Address":' + $IPv6Address + ',' +
+			'"IPv6DefaultGateway":' + $IPv6DefaultGateway + ',' +
+			'"IPv4DefaultGateway":' + $IPv4DefaultGateway + ',' +
+			'"DNSServer":' + $DNSServer + ',' +
+			'"SubnetMask":' + $SubnetMask +
+			'}'
+		}
+		
+		# Properly format JSON array
+		$jsonOutput = '[' + ($jsonObjects -join ',') + ']'
+	}
+	
+	# Output JSON properly to console
+	 $jsonOutput
+	
+
 	`
 
 	output, err := createAndRunPS1FileWithOutput("getnetworkinterface.ps1", script)
@@ -10495,18 +10978,19 @@ func getRDPStatusV2() (string, error) {
 
 func getStartupCommands2() (string, error) {
 	script := `
-		# Build a mapping of startup item names to their status
-		$StartupApprovedPaths = @(
-			"HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
-			"HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
-			"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
-			"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
-			"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
-		)
+	# Build a mapping of startup item names to their status
+	$StartupApprovedPaths = @(
+		"HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+		"HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
+		"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+		"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
+		"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
+	)
 
-		$StatusMap = @{}
+	$StatusMap = @{}
 
-		foreach ($Path in $StartupApprovedPaths) {
+	foreach ($Path in $StartupApprovedPaths) {
+		if (Test-Path $Path) {  # Check if the registry path exists before accessing
 			try {
 				$Items = Get-ItemProperty -Path $Path
 				foreach ($Property in $Items.PSObject.Properties) {
@@ -10538,7 +11022,12 @@ func getStartupCommands2() (string, error) {
 				# Ignore errors (e.g., if the registry path doesn't exist)
 			}
 		}
+	}
 
+	
+
+	# PowerShell 3+ JSON conversion
+	if (Get-Command ConvertTo-Json -ErrorAction SilentlyContinue) {
 		# Get information about Win32_StartupCommand and add Status
 		$StartupCommands = Get-CimInstance -ClassName Win32_StartupCommand |
 			Select-Object Caption, Description, SettingID, Command, Location, Name, User, UserSID, PSComputerName, CimClass |
@@ -10561,9 +11050,49 @@ func getStartupCommands2() (string, error) {
 				$_ | Add-Member -NotePropertyName 'Status' -NotePropertyValue $Status -Force
 				$_
 			}
+		$StartupJson = $StartupCommands | ConvertTo-Json -Depth 2 -Compress
+	} else {
+		# Get information about Win32_StartupCommand and add Status
+		$StartupCommands = Get-WmiObject -Class Win32_StartupCommand |
+			Select-Object Caption, Description, SettingID, Command, Location, Name, User, UserSID, PSComputerName |
+			ForEach-Object {
+				$LookupName = $_.Name
 
-		# Convert the information to JSON format
-		$StartupCommands | ConvertTo-Json -Depth 2 -Compress
+				# Attempt to find the status directly
+				if ($StatusMap.ContainsKey($LookupName)) {
+					$Status = $StatusMap[$LookupName]
+				} else {
+					# Try appending '.lnk' to the name
+					$LookupNameWithLnk = $LookupName + '.lnk'
+					if ($StatusMap.ContainsKey($LookupNameWithLnk)) {
+						$Status = $StatusMap[$LookupNameWithLnk]
+					} else {
+						$Status = "Unknown"
+					}
+				}
+
+				$_ | Add-Member -MemberType NoteProperty -Name 'Status' -Value $Status -Force
+				$_
+			}
+		# PowerShell 2.0 JSON conversion fallback
+		function Convert-To-Json-PS2 ($obj) {
+			if (!$obj -or $obj.Count -eq 0) { return "[]" }
+			$jsonObjects = foreach ($item in $obj) {
+				$props = $item.PSObject.Properties | ForEach-Object {
+					'"' + $_.Name + '":"' + ($_.Value -replace '\\', '\\' -replace '"', '"') + '"'
+				}
+				'{' + ($props -join ',') + '}'
+			}
+			'[' + ($jsonObjects -join ',') + ']'
+		}
+		$StartupJson = Convert-To-Json-PS2 $StartupCommands
+	}
+
+	# Remove newlines to ensure single-line JSON output
+	$StartupJson
+
+
+	
 
 	`
 	output, err := createAndRunPS1FileWithOutput("startup.ps1", script)
@@ -11842,6 +12371,10 @@ type ApiRealTimeRedisResponse struct {
 	UploadUsers        bool   `json:"uploadUsers"`
 	RecheckinProduct   bool   `json:"recheckinProduct"` // Only recheckin product, eg: Chrome, Firefox, Office.
 	ProductName        string `json:"productName"`      // The name of the product to recheckin, eg: Chrome, Firefox, Office.
+
+	DdaScan              bool `json:"ddaScan"`              // Call the DDA agent
+	ScanID               int  `json:"scanID"`               // The ID of the scan to call the DDA agent
+	DdaScanConfiguration bool `json:"ddaScanConfiguration"` // Call the DDA agent with the configuration
 }
 
 func initRedis(iniData ini.IniConfig) *redis.Client {
@@ -12034,6 +12567,14 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 	// This does not return "cyscan=0", only if the json configurations for cyscan exit, then it would return "cyscan=1"
 	if responseBody.Cyscan {
 		go runCyscanAndUploadItsOutput(responseBody.JsonFile)
+	}
+
+	if responseBody.DdaScan {
+		go runDDAScanAndUploadItsOutput(responseBody.ScanID)
+	}
+
+	if responseBody.DdaScanConfiguration {
+		go runDDAScanAndUploadItsOutput(responseBody.ScanID)
 	}
 
 	if responseBody.Recheckin {
