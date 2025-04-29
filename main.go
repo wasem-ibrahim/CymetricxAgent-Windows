@@ -55,10 +55,10 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/rs/zerolog/pkgerrors"
-	"github.com/shirou/gopsutil/v4/cpu"
-	"github.com/shirou/gopsutil/v4/disk"
-	"github.com/shirou/gopsutil/v4/mem"
-	"github.com/shirou/gopsutil/v4/process"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/mem"
+	"github.com/shirou/gopsutil/v3/process"
 
 	"github.com/yusufpapurcu/wmi"
 	"golang.org/x/sys/windows"
@@ -5348,6 +5348,33 @@ func sendNewCyscanVersionToServerToUpdateDBV2(newCyscanVersionNumber string) err
 	return fmt.Errorf("failed to update cyscan version on the server: %s", apiUpdateCyscanAgentResponse.Message)
 }
 
+// sendNewCyscanVersionToServerToUpdateDBV2 sends the new cyscan version that was
+// installed to the server so it would take it and update the database with its
+// value
+func sendNewBinaryVersionToServerToUpdateDBV2(newVersionNumber, binaryName string) error {
+
+	// Send the new version number of Cyscan to the server so it can update the DB.
+	// endPoint := id + "/update_cyscan_agent/" + newVersionNumber
+	endPoint := fmt.Sprintf("%s/update_%s_agent/%s", id, binaryName, newVersionNumber)
+	responseBody, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("GET", endPoint, nil, 10)
+	if err != nil {
+		return fmt.Errorf("failed to execute %s API call: %w", endPoint, err)
+	}
+
+	var apiUpdateCyscanAgentResponse ApiUpdateCyscanAgentResponse
+
+	if err := json.Unmarshal(responseBody.Bytes(), &apiUpdateCyscanAgentResponse); err != nil {
+		return fmt.Errorf("failed to unmarshal response body: %w", err)
+	}
+
+	if apiUpdateCyscanAgentResponse.Status {
+		log.Info().Msgf("Successfully updated %s version on the server.", binaryName)
+		return nil
+	}
+
+	return fmt.Errorf("failed to update %s version on the server: %s", binaryName, apiUpdateCyscanAgentResponse.Message)
+}
+
 // getTaskListAndCompressItIntoZipFile creates a zip file containing the task manager data
 // inside of a csv file. It then compresses it into a zip file.
 func getTaskListAndCompressItIntoZipFile() error {
@@ -6961,7 +6988,7 @@ func runDDAScanAndUploadItsOutput(scanID int) (err error) {
 
 	defer logError(&err, "Error in runDDAScanAndUploadItsOutput")
 
-	if err := fetchAndSaveDDAConfigurations(scanID); err != nil {
+	if err := fetchAndSaveDDAConfigurations(scanID, false); err != nil {
 		return err
 	}
 
@@ -6979,8 +7006,14 @@ func runDDAScanAndUploadItsOutput(scanID int) (err error) {
 	return nil
 }
 
-func fetchAndSaveDDAConfigurations(scanID int) error {
-	apiEndPoint := fmt.Sprintf("data-discovery/get-configuration/%s/%d", id, scanID)
+func fetchAndSaveDDAConfigurations(scanID int, update bool) error {
+	var apiEndPoint string
+	if update {
+		apiEndPoint = fmt.Sprintf("data-discovery/update-configuration/%s/%d", id, scanID)
+	} else {
+		apiEndPoint = fmt.Sprintf("data-discovery/get-configuration/%s/%d", id, scanID)
+	}
+
 	configurationsJson, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("GET", apiEndPoint, nil, 10)
 	if err != nil {
 		return fmt.Errorf("error in getting configurations for DDA scan: %w", err)
@@ -12372,6 +12405,12 @@ type ApiRealTimeRedisResponse struct {
 	RecheckinProduct   bool   `json:"recheckinProduct"` // Only recheckin product, eg: Chrome, Firefox, Office.
 	ProductName        string `json:"productName"`      // The name of the product to recheckin, eg: Chrome, Firefox, Office.
 
+	CyScanUpdate     bool   `json:"cyscanupdate"`
+	CyScanNewVersion string `json:"cyscannewversion"`
+
+	DdaScanUpdate     bool   `json:"ddascanupdate"`
+	DdaScanNewVersion string `json:"ddascannewversion"`
+
 	DdaScan              bool `json:"ddaScan"`              // Call the DDA agent
 	ScanID               int  `json:"scanID"`               // The ID of the scan to call the DDA agent
 	DdaScanConfiguration bool `json:"ddaScanConfiguration"` // Call the DDA agent with the configuration
@@ -12564,6 +12603,15 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 		// Return the time to wait back to its normal time range
 	}
 
+	if responseBody.CyScanUpdate {
+		go startBinaryUpdate(responseBody.CyScanNewVersion, "cyscan")
+
+	}
+
+	if responseBody.DdaScanUpdate {
+		go startBinaryUpdate(responseBody.DdaScanNewVersion, "dda")
+	}
+
 	// This does not return "cyscan=0", only if the json configurations for cyscan exit, then it would return "cyscan=1"
 	if responseBody.Cyscan {
 		go runCyscanAndUploadItsOutput(responseBody.JsonFile)
@@ -12574,7 +12622,11 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 	}
 
 	if responseBody.DdaScanConfiguration {
-		go runDDAScanAndUploadItsOutput(responseBody.ScanID)
+		// go runDDAScanAndUploadItsOutput(responseBody.ScanID)
+
+		if err := fetchAndSaveDDAConfigurations(responseBody.ScanID, true); err != nil {
+			log.Error().Err(err).Msg("Failed to fetch and save DDA configurations after getting signal to update it.")
+		}
 	}
 
 	if responseBody.Recheckin {
@@ -12951,13 +13003,18 @@ type ApiRealTimeResponse struct {
 	LocalDNS              bool   `json:"localdns"`
 	LocalUsers            bool   `json:"localusers"`
 	Patches               bool   `json:"patches"`
-	CyScanUpdate          bool   `json:"cyscanupdate"`
-	CyScanNewVersion      string `json:"cyscannewversion"`
-	RealService           bool   `json:"realservice"`
-	TaskList              bool   `json:"tasklist"`
-	AppManager            bool   `json:"appmanager"`
-	Cyscan                bool   `json:"cyscan,omitempty"`
-	JsonFile              string `json:"jsonfile,omitempty"`
+
+	CyScanUpdate     bool   `json:"cyscanupdate"`
+	CyScanNewVersion string `json:"cyscannewversion"`
+
+	DdaScanUpdate     bool   `json:"ddascanupdate"`
+	DdaScanNewVersion string `json:"ddascannewversion"`
+
+	RealService bool   `json:"realservice"`
+	TaskList    bool   `json:"tasklist"`
+	AppManager  bool   `json:"appmanager"`
+	Cyscan      bool   `json:"cyscan,omitempty"`
+	JsonFile    string `json:"jsonfile,omitempty"`
 
 	TimeUSN                   int  `json:"timeUSN"`
 	Leader                    bool `json:"leader"`
@@ -13064,10 +13121,12 @@ func processRealTimeServerInstructions(responseBody ApiRealTimeResponse, serialN
 	}
 
 	if responseBody.CyScanUpdate {
-		// if err := startCyscanUpdateProcessV2(responseBody); err != nil {
-		// 	log.Error().Err(err).Msg("Failed to update cyscan.")
-		// }
-		go startCyscanUpdateProcessV2(responseBody)
+		go startBinaryUpdate(responseBody.CyScanNewVersion, "cyscan")
+
+	}
+
+	if responseBody.DdaScanUpdate {
+		go startBinaryUpdate(responseBody.DdaScanNewVersion, "dda")
 	}
 
 	if responseBody.Commands != "" {
@@ -13105,6 +13164,35 @@ func startCyscanUpdateProcessV2(responseBody ApiRealTimeResponse) error {
 	}
 
 	log.Info().Msg("Successfully updated cyscan.")
+	return nil
+}
+
+// startCyscanUpdateProcessV2 is resoponsible for updating cyscan.exe if there is an update for it and the user clicks on the update button on the website.
+// It would download the new cyscan.exe and remove the old one. This means that there is no need to update the whole agent to update cyscan.
+func startBinaryUpdate(newVersionNumber string, binaryName string) error {
+	log.Info().Msgf("Starting the process of updating %s...", binaryName)
+
+	var versionFilePath string
+	switch binaryName {
+	case "cyscan":
+		versionFilePath = filepath.Join(CymetricxPath, "CYSCAN_Version.txt")
+	case "dda":
+		versionFilePath = filepath.Join(CymetricxPath, "DDA_Version.txt")
+	}
+
+	if err := updateBinaryIfNewVersion(versionFilePath, newVersionNumber, binaryName); err != nil {
+		return err
+	}
+
+	if err := sendNewBinaryVersionToServerToUpdateDBV2(newVersionNumber, binaryName); err != nil {
+		return err
+	}
+
+	if err := createFileWithPermissionsAndWriteToIt(versionFilePath, newVersionNumber, 0644); err != nil {
+		return fmt.Errorf("failed to create %s file: %w", versionFilePath, err)
+	}
+
+	log.Info().Msgf("Successfully updated %s.", binaryName)
 	return nil
 }
 
@@ -13158,6 +13246,56 @@ func updateCyscanIfNewVersion(cyscanVersionPath string, newCyscanVersionNumber s
 	return nil
 }
 
+// updateCyscanIfNewVersion checks if there is a new version for cyscan.exe, if so, it would remove the old one and download the new one.
+/*
+	2 cases:
+
+	1- "CYSCAN_Version.txt" does not exist:
+		- cyscan.exe already exit, because it was installed by advance installer
+		- cyscan_Version.txt does not exist, because it exist after you run cyscan.exe
+		- Remove both cyscan.exe, and download the new one
+
+	2- "CYSCAN_Version.txt" exist:
+		- cyscan.exe already exit, because it was installed by advance installer
+		- cyscan_Version.txt
+		- read cyscan_Version file
+		Here we have two cases:
+			1. the response didn't include the new number for the cyscan version:
+				- Remove old cyscan
+				- install new cyscan.exe
+			2. the response included the new number for the cyscan version,
+				- check if the old cyscan.exe version is not the same as the one in the response
+				- if so, remove old cyscan
+				- install new cyscan
+*/
+func updateBinaryIfNewVersion(versionFilePath, newVersionNumber, binaryName string) error {
+	// if the file does not exist.
+	if !fileExists(versionFilePath) {
+		if err := downloadAndReplaceBinaryFile(binaryName); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// If file exists, read the version number from it.
+	versionRaw, err := os.ReadFile(versionFilePath)
+	if err != nil {
+		return fmt.Errorf("error reading file %s: %w", versionFilePath, err)
+	}
+	version := string(versionRaw)
+
+	// If the version number in the response is not the same as the one in the
+	// file, then download the new cyscan. Also, if the version number in the
+	// response is empty, then download the new cyscan.exe.
+	if version != newVersionNumber || newVersionNumber == "" {
+		if err := downloadAndReplaceBinaryFile(binaryName); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // downloadAndReplaceCyscanFile downloads the new cyscan and replaces the
 // old one with it.
 func downloadAndReplaceCyscanFile() error {
@@ -13180,6 +13318,36 @@ func downloadAndReplaceCyscanFile() error {
 
 	if err := excuteDownloadAndWriteToFile(req, file); err != nil {
 		return fmt.Errorf("error executing download cyscan file: %w", err)
+	}
+
+	return nil
+}
+
+// downloadAndReplaceCyscanFile downloads the new cyscan and replaces the
+// old one with it.
+func downloadAndReplaceBinaryFile(binaryName string) error {
+	// Cyscan file path on the system.
+	fileName := fmt.Sprintf("%s.exe", binaryName)
+	filePath := filepath.Join(CymetricxPath, fileName)
+
+	// Create or truncate the file with excute permissions.
+	file, err := createFileWithPermissions(filePath, 0744)
+	if err != nil {
+		return fmt.Errorf("error while creating %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	// Create a new HTTP request with a timeout.
+	apiEndPoint := fmt.Sprintf("download/%s", fileName)
+	// req, cancel, err := createHTTPRequestWithTimeoutForNoAPIEndpointsV2("GET", apiEndPoint, nil)
+	req, cancel, err := createHTTPRequestWithTimeoutV2("GET", apiEndPoint, nil)
+	if err != nil {
+		return fmt.Errorf("could not create http request with timeout for %s: %w", apiEndPoint, err)
+	}
+	defer cancel()
+
+	if err := excuteDownloadAndWriteToFile(req, file); err != nil {
+		return fmt.Errorf("error executing download %s file: %w", binaryName, err)
 	}
 
 	return nil
