@@ -6988,6 +6988,17 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 	defer catchPanic()
 	defer logError(&err, "Error in runDDAScanAndUploadItsOutput")
 
+	// Don't run the DDA scan if it's already in progress
+	progressStatus, err := checkDDAProgressFile()
+	if err != nil {
+		return fmt.Errorf("failed to check DDA progress file: %w", err)
+	}
+
+	if progressStatus == "In Progress" {
+		log.Info().Msg("DDA scan is already in progress. Skipping the new scan.")
+		return nil
+	}
+
 	// Save the scan ID for recovery in case of unexpected exit
 	err = saveCurrentScanID(scanID)
 	if err != nil {
@@ -7022,11 +7033,11 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 	return nil
 }
 
-func checkProgressFile() (string, error) {
+func checkDDAProgressFile() (string, error) {
 	progressFilePath := filepath.Join(CymetricxPath, "dda-progress.json")
 
 	if !fileExists(progressFilePath) {
-		return "In Progress", nil
+		return "", nil
 	}
 
 	data, err := os.ReadFile(progressFilePath)
