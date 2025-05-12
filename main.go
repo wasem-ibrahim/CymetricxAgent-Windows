@@ -6988,19 +6988,26 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 	defer catchPanic()
 	defer logError(&err, "Error in runDDAScanAndUploadItsOutput")
 
-	// Don't run the DDA scan if it's already in progress
-	progressStatus, err := checkDDAProgressFile()
+	log.Info().Msg("Starting the process of running dda.exe and uploading its output ...")
+
+	const savedScanIDPath = "dda-scan-id.txt"
+	// if fileExists(savedScanIDPath) && !previousUnfinishedScan {
+	// 	log.Info().Msg("DDA scan is already running. Skipping the execution.")
+	// 	return nil
+	// }
+
+	isDDAProcessRunning, err := isDDARunning()
 	if err != nil {
-		return fmt.Errorf("failed to check DDA progress file: %w", err)
+		return fmt.Errorf("error checking if DDA is running: %w", err)
 	}
 
-	if progressStatus == "In Progress" {
-		log.Info().Msg("DDA scan is already in progress. Skipping the new scan.")
+	if isDDAProcessRunning {
+		log.Info().Msg("DDA scan is already running. Skipping the execution.")
 		return nil
 	}
 
 	// Save the scan ID for recovery in case of unexpected exit
-	err = saveCurrentScanID(scanID)
+	err = saveCurrentScanID(scanID, savedScanIDPath)
 	if err != nil {
 		return fmt.Errorf("failed to save current scan ID: %w", err)
 	}
@@ -7021,7 +7028,7 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 	log.Debug().Msg("dda.exe process completed.")
 
 	// Cleanup saved scan ID once finished
-	err = deleteCurrentScanID()
+	err = deleteCurrentScanID(savedScanIDPath)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to delete saved scan ID file after finishing the scan.")
 	}
@@ -7029,6 +7036,8 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 	if err := collectDDADBDataAndCompressAndUploadIt(scanID, ddaError); err != nil {
 		return err
 	}
+
+	log.Info().Msg("Successfully ran dda.exe and uploaded its output.")
 
 	return nil
 }
@@ -7061,8 +7070,7 @@ func checkDDAProgressFile() (string, error) {
 }
 
 // saveCurrentScanID writes the current scan ID to a file.
-func saveCurrentScanID(scanID int) error {
-	const savedScanIDPath = "dda-scan-id.txt"
+func saveCurrentScanID(scanID int, savedScanIDPath string) error {
 	savedScanIDFullPath := filepath.Join(CymetricxPath, savedScanIDPath)
 	return os.WriteFile(savedScanIDFullPath, []byte(fmt.Sprintf("%d", scanID)), 0644)
 }
@@ -7085,8 +7093,7 @@ func getSavedScanID() (int, error) {
 }
 
 // deleteCurrentScanID removes the saved scan ID file.
-func deleteCurrentScanID() error {
-	const savedScanIDPath = "dda-scan-id.txt"
+func deleteCurrentScanID(savedScanIDPath string) error {
 	savedScanIDFullPath := filepath.Join(CymetricxPath, savedScanIDPath)
 
 	return os.Remove(savedScanIDFullPath)
@@ -7101,10 +7108,7 @@ func tryRecoverUnfinishedDDAScan() {
 	}
 
 	log.Info().Msgf("Recovering unfinished scan with scanID %d...", scanID)
-	err = runDDAScanAndUploadItsOutput(scanID, "")
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to recover and rerun DDA scan")
-	}
+	go runDDAScanAndUploadItsOutput(scanID, "")
 }
 
 func isDDARunning() (bool, error) {
@@ -7157,7 +7161,8 @@ func monitorProgressFileAndUploadProgress(scanID int) {
 	}
 
 	for {
-		time.Sleep(3 * time.Minute)
+		// time.Sleep(3 * time.Minute)
+		time.Sleep(3 * time.Second)
 
 		info, err := os.Stat(filePath)
 		if err != nil {
@@ -7177,9 +7182,22 @@ func monitorProgressFileAndUploadProgress(scanID int) {
 		lastModTime = modTime // update stored time
 
 		log.Info().Msgf(
-			"File %s modified: %v → %v",
+			"File %s modified: %v → %v DDA scan progress file updated.",
 			filePath, prev, modTime,
 		)
+
+		// Retrieve progress data as JSON.
+		progressStruct, err := getProgressTableAsJsonFromDDADB()
+		if err != nil {
+			log.Error().Err(err).Msg("Error while getting progress table as JSON from DDA DB")
+		}
+
+		percentageCompleted := progressStruct.Percentage
+
+		if percentageCompleted == 100 {
+			log.Info().Msg("DDA scan completed successfully with 100% progress, exiting the monitoring loop.")
+			break
+		}
 
 		if err := uploadProgressData(scanID, nil); err != nil {
 			log.Error().Err(err).Msg("uploadProgressData")
@@ -7281,19 +7299,29 @@ func uploadProgressData(scanID int, ddaError error) error {
 	log.Info().Msg("Starting progress JSON upload process for DDA DB.")
 
 	// Retrieve progress data as JSON.
-	progressJSON, err := getProgressTableAsJsonFromDDADB()
+	progressStruct, err := getProgressTableAsJsonFromDDADB()
 	if err != nil {
 		return fmt.Errorf("error while getting progress table as JSON from DDA DB: %w", err)
 	}
 
+	percentageCompleted := progressStruct.Percentage
+
+	log.Info().Msgf("DDA scan progress: %d%%", percentageCompleted)
+
 	if ddaError != nil {
 		// If dda failed, then set the status to Failed to tell sever that i failed
-		progressJSON = bytes.Replace(progressJSON, []byte("In Progress"), []byte("Failed"), -1)
+		progressStruct.Status = "Failed"
+		// progressStruct = bytes.Replace(progressStruct, []byte("In Progress"), []byte("Failed"), -1)
+	}
+
+	progressStructBytes, err := json.Marshal(progressStruct)
+	if err != nil {
+		return fmt.Errorf("error while marshalling progress struct to JSON: %w", err)
 	}
 
 	// Build endpoint for uploading progress data.
 	scanProgressEndPoint := fmt.Sprintf("data-discovery/store-scan-progress/%s/%d", id, scanID)
-	responseBody, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", scanProgressEndPoint, progressJSON, 10)
+	responseBody, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("POST", scanProgressEndPoint, progressStructBytes, 10)
 	if err != nil {
 		return fmt.Errorf("error in sending scan progress: %w", err)
 	}
@@ -7319,17 +7347,33 @@ func getSenstiveDataTableAsCSVFromDDADB() (string, error) {
 	return sensitiveDataCSVPath, nil
 }
 
-func getProgressTableAsJsonFromDDADB() ([]byte, error) {
+type DdaProgress struct {
+	FilesDone              int     `json:"FilesDone"`
+	FilesTotal             int     `json:"FilesTotal"`
+	Percentage             int     `json:"Percentage"`
+	RemainingTimeInSeconds int     `json:"RemainingTimeInSeconds"`
+	SizeDoneInMegaBytes    float64 `json:"SizeDoneInMegaBytes"`
+	SizeTotalInMegaBytes   float64 `json:"SizeTotalInMegaBytes"`
+	Status                 string  `json:"Status"`
+}
+
+func getProgressTableAsJsonFromDDADB() (DdaProgress, error) {
+	var progress DdaProgress
+
 	progressJSONPath := filepath.Join(CymetricxPath, "dda-progress.json")
 
 	jsonContent, err := os.ReadFile(progressJSONPath)
 	if err != nil {
-		return nil, fmt.Errorf("error reading dda-progress.json file: %w", err)
+		return DdaProgress{}, fmt.Errorf("error reading progress file: %w", err)
 	}
 
 	jsonContent = bytes.TrimSpace(jsonContent)
 
-	return jsonContent, nil
+	if err := json.Unmarshal(jsonContent, &progress); err != nil {
+		return DdaProgress{}, fmt.Errorf("error unmarshalling progress JSON: %w", err)
+	}
+
+	return progress, nil
 }
 
 // exportTableToCSV opens an SQLite3 database from dbPath, queries all rows from tableName,
