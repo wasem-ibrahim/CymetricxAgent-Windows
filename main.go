@@ -6956,13 +6956,20 @@ func runCyscanAndUploadItsOutput(jsonFileContent string) (err error) {
 
 	log.Info().Msg("Starting the process of running cyscan and uploading its output ...")
 
+	cyscanPath := filepath.Join(CymetricxPath, "cyscan.exe")
+	if !fileExists(cyscanPath) {
+		log.Error().Msgf("cyscan.exe not found at %s, Downloading cyscan.exe...", cyscanPath)
+		if err := downloadAndReplaceBinaryFile("cyscan"); err != nil {
+			return err
+		}
+	}
+
 	// Create the json file that the cyscan will use.
 	jsonFilePath := filepath.Join(CymetricxPath, "ip-rules.json")
 	if err = createFileWithPermissionsAndWriteToIt(jsonFilePath, jsonFileContent, 0644); err != nil {
 		return fmt.Errorf("error in creating file and writing to it: %w", err)
 	}
 
-	cyscanPath := filepath.Join(CymetricxPath, "cyscan.exe")
 	if err := execCommandWithoutOutput(cmdPath, "/c", cyscanPath); err != nil {
 		return fmt.Errorf("error in executing cyscan command: %w", err)
 	}
@@ -6990,11 +6997,13 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 
 	log.Info().Msg("Starting the process of running dda.exe and uploading its output ...")
 
-	const savedScanIDPath = "dda-scan-id.txt"
-	// if fileExists(savedScanIDPath) && !previousUnfinishedScan {
-	// 	log.Info().Msg("DDA scan is already running. Skipping the execution.")
-	// 	return nil
-	// }
+	ddaPath := filepath.Join(CymetricxPath, "dda.exe")
+	if !fileExists(ddaPath) {
+		log.Error().Msgf("dda.exe not found at %s, Downloading dda.exe...", ddaPath)
+		if err := downloadAndReplaceBinaryFile("dda"); err != nil {
+			return err
+		}
+	}
 
 	isDDAProcessRunning, err := isDDARunning()
 	if err != nil {
@@ -7007,7 +7016,7 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 	}
 
 	// Save the scan ID for recovery in case of unexpected exit
-	err = saveCurrentScanID(scanID, savedScanIDPath)
+	err = saveCurrentScanID(scanID)
 	if err != nil {
 		return fmt.Errorf("failed to save current scan ID: %w", err)
 	}
@@ -7018,7 +7027,6 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 
 	go monitorProgressFileAndUploadProgress(scanID)
 
-	ddaPath := filepath.Join(CymetricxPath, "dda.exe")
 	ddaError := execCommandWithoutOutput(cmdPath, "/c", ddaPath)
 	if ddaError != nil {
 		// return fmt.Errorf("error in executing cyscan command: %w", err)
@@ -7028,7 +7036,7 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 	log.Debug().Msg("dda.exe process completed.")
 
 	// Cleanup saved scan ID once finished
-	err = deleteCurrentScanID(savedScanIDPath)
+	err = deleteCurrentScanID()
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to delete saved scan ID file after finishing the scan.")
 	}
@@ -7070,7 +7078,9 @@ func checkDDAProgressFile() (string, error) {
 }
 
 // saveCurrentScanID writes the current scan ID to a file.
-func saveCurrentScanID(scanID int, savedScanIDPath string) error {
+func saveCurrentScanID(scanID int) error {
+	const savedScanIDPath = "dda-scan-id.txt"
+
 	savedScanIDFullPath := filepath.Join(CymetricxPath, savedScanIDPath)
 	return os.WriteFile(savedScanIDFullPath, []byte(fmt.Sprintf("%d", scanID)), 0644)
 }
@@ -7093,9 +7103,10 @@ func getSavedScanID() (int, error) {
 }
 
 // deleteCurrentScanID removes the saved scan ID file.
-func deleteCurrentScanID(savedScanIDPath string) error {
-	savedScanIDFullPath := filepath.Join(CymetricxPath, savedScanIDPath)
+func deleteCurrentScanID() error {
+	const savedScanIDPath = "dda-scan-id.txt"
 
+	savedScanIDFullPath := filepath.Join(CymetricxPath, savedScanIDPath)
 	return os.Remove(savedScanIDFullPath)
 }
 
@@ -7161,8 +7172,8 @@ func monitorProgressFileAndUploadProgress(scanID int) {
 	}
 
 	for {
-		// time.Sleep(3 * time.Minute)
-		time.Sleep(3 * time.Second)
+		time.Sleep(3 * time.Minute)
+		// time.Sleep(3 * time.Second)
 
 		info, err := os.Stat(filePath)
 		if err != nil {
@@ -7350,7 +7361,7 @@ func getSenstiveDataTableAsCSVFromDDADB() (string, error) {
 type DdaProgress struct {
 	FilesDone              int     `json:"FilesDone"`
 	FilesTotal             int     `json:"FilesTotal"`
-	Percentage             int     `json:"Percentage"`
+	Percentage             float64 `json:"Percentage"`
 	RemainingTimeInSeconds int     `json:"RemainingTimeInSeconds"`
 	SizeDoneInMegaBytes    float64 `json:"SizeDoneInMegaBytes"`
 	SizeTotalInMegaBytes   float64 `json:"SizeTotalInMegaBytes"`
@@ -13322,29 +13333,8 @@ func processRealTimeServerInstructions(responseBody ApiRealTimeResponse, serialN
 //$ ----------------------------------------------------------------------------------------------------------------------------------------------------
 //$ ----------------------------------------------------------------------------------------------------------------------------------------------------
 
-// startCyscanUpdateProcessV2 is resoponsible for updating cyscan.exe if there is an update for it and the user clicks on the update button on the website.
-// It would download the new cyscan.exe and remove the old one. This means that there is no need to update the whole agent to update cyscan.
-func startCyscanUpdateProcessV2(responseBody ApiRealTimeResponse) error {
-	log.Info().Msg("Starting the process of updating cyscan...")
-
-	newCyscanVersionNumber := responseBody.CyScanNewVersion
-
-	// Path for the text file that holds the version of the cyscan
-	cyscanVersionPath := filepath.Join(CymetricxPath, "CYSCAN_Version.txt")
-	if err := updateCyscanIfNewVersion(cyscanVersionPath, newCyscanVersionNumber); err != nil {
-		return err
-	}
-
-	if err := sendNewCyscanVersionToServerToUpdateDBV2(newCyscanVersionNumber); err != nil {
-		return err
-	}
-
-	log.Info().Msg("Successfully updated cyscan.")
-	return nil
-}
-
-// startCyscanUpdateProcessV2 is resoponsible for updating cyscan.exe if there is an update for it and the user clicks on the update button on the website.
-// It would download the new cyscan.exe and remove the old one. This means that there is no need to update the whole agent to update cyscan.
+// startCyscanUpdateProcessV2 is resoponsible for updating cyscan/dda if there is an update for it and the user clicks on the update button on the website.
+// It would download the new binary and remove the old one. This means that there is no need to update the whole agent to update the binary.
 func startBinaryUpdate(newVersionNumber string, binaryName string) error {
 	log.Info().Msgf("Starting the process of updating %s...", binaryName)
 
@@ -13369,56 +13359,6 @@ func startBinaryUpdate(newVersionNumber string, binaryName string) error {
 	}
 
 	log.Info().Msgf("Successfully updated %s.", binaryName)
-	return nil
-}
-
-// updateCyscanIfNewVersion checks if there is a new version for cyscan.exe, if so, it would remove the old one and download the new one.
-/*
-	2 cases:
-
-	1- "CYSCAN_Version.txt" does not exist:
-		- cyscan.exe already exit, because it was installed by advance installer
-		- cyscan_Version.txt does not exist, because it exist after you run cyscan.exe
-		- Remove both cyscan.exe, and download the new one
-
-	2- "CYSCAN_Version.txt" exist:
-		- cyscan.exe already exit, because it was installed by advance installer
-		- cyscan_Version.txt
-		- read cyscan_Version file
-		Here we have two cases:
-			1. the response didn't include the new number for the cyscan version:
-				- Remove old cyscan
-				- install new cyscan.exe
-			2. the response included the new number for the cyscan version,
-				- check if the old cyscan.exe version is not the same as the one in the response
-				- if so, remove old cyscan
-				- install new cyscan
-*/
-func updateCyscanIfNewVersion(cyscanVersionPath string, newCyscanVersionNumber string) error {
-	// if the file does not exist.
-	if !fileExists(cyscanVersionPath) {
-		if err := downloadAndReplaceCyscanFile(); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	// If file exists, read the version number from it.
-	cyscanVersionRaw, err := os.ReadFile(cyscanVersionPath)
-	if err != nil {
-		return fmt.Errorf("error reading file %s: %w", cyscanVersionPath, err)
-	}
-	cyscanVersion := string(cyscanVersionRaw)
-
-	// If the version number in the response is not the same as the one in the
-	// file, then download the new cyscan. Also, if the version number in the
-	// response is empty, then download the new cyscan.exe.
-	if cyscanVersion != newCyscanVersionNumber || newCyscanVersionNumber == "" {
-		if err := downloadAndReplaceCyscanFile(); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
@@ -13472,37 +13412,10 @@ func updateBinaryIfNewVersion(versionFilePath, newVersionNumber, binaryName stri
 	return nil
 }
 
-// downloadAndReplaceCyscanFile downloads the new cyscan and replaces the
-// old one with it.
-func downloadAndReplaceCyscanFile() error {
-	// Cyscan file path on the system.
-	fileName := filepath.Join(CymetricxPath, "cyscan.exe")
-
-	// Create or truncate the file with excute permissions.
-	file, err := createFileWithPermissions(fileName, 0744)
-	if err != nil {
-		return fmt.Errorf("error while creating %s: %w", fileName, err)
-	}
-	defer file.Close()
-
-	// Create a new HTTP request with a timeout.
-	req, cancel, err := createHTTPRequestWithTimeoutForNoAPIEndpointsV1("GET", "download/cyscan.exe", nil)
-	if err != nil {
-		return fmt.Errorf("could not create http request with timeout for /download/cyscan: %w", err)
-	}
-	defer cancel()
-
-	if err := excuteDownloadAndWriteToFile(req, file); err != nil {
-		return fmt.Errorf("error executing download cyscan file: %w", err)
-	}
-
-	return nil
-}
-
-// downloadAndReplaceCyscanFile downloads the new cyscan and replaces the
+// downloadAndReplaceCyscanFile downloads the new binary and replaces the
 // old one with it.
 func downloadAndReplaceBinaryFile(binaryName string) error {
-	// Cyscan file path on the system.
+	// binary file path on the system.
 	fileName := fmt.Sprintf("%s.exe", binaryName)
 	filePath := filepath.Join(CymetricxPath, fileName)
 
@@ -13525,6 +13438,8 @@ func downloadAndReplaceBinaryFile(binaryName string) error {
 	if err := excuteDownloadAndWriteToFile(req, file); err != nil {
 		return fmt.Errorf("error executing download %s file: %w", binaryName, err)
 	}
+
+	log.Info().Msgf("Successfully downloaded and replaced %s file.", binaryName)
 
 	return nil
 }
