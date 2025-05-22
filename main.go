@@ -7026,6 +7026,7 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 	}
 
 	go monitorProgressFileAndUploadProgress(scanID)
+	go monitorProgressFileAndUploadDDASensitiveData(scanID)
 
 	ddaError := execCommandWithoutOutput(cmdPath, "/c", ddaPath)
 	if ddaError != nil {
@@ -7162,6 +7163,8 @@ func fetchAndSaveDDAConfigurations(scanID int, endPointName string) error {
 func monitorProgressFileAndUploadProgress(scanID int) {
 	defer catchPanic()
 
+	log.Info().Msg("Starting to monitor dda-progress.json file for changes...")
+
 	filePath := filepath.Join(CymetricxPath, "dda-progress.json")
 
 	// If the file already exists, seed lastModTime so
@@ -7203,15 +7206,72 @@ func monitorProgressFileAndUploadProgress(scanID int) {
 			log.Error().Err(err).Msg("Error while getting progress table as JSON from DDA DB")
 		}
 
-		percentageCompleted := progressStruct.Percentage
-
-		if percentageCompleted == 100 {
-			log.Info().Msg("DDA scan completed successfully with 100% progress, exiting the monitoring loop.")
+		if progressStruct.Status == "Failed" || progressStruct.Status == "Stopped" || progressStruct.Status == "Finished" {
+			log.Info().Msgf("DDA scan status is %s; stopping monitoring.", progressStruct.Status)
 			break
 		}
 
 		if err := uploadProgressData(scanID, nil); err != nil {
 			log.Error().Err(err).Msg("uploadProgressData")
+		}
+	}
+}
+
+func monitorProgressFileAndUploadDDASensitiveData(scanID int) {
+	defer catchPanic()
+
+	log.Info().Msg("Starting to monitor dda-progress.json for DDA sensitive data uploads…")
+	filePath := filepath.Join(CymetricxPath, "dda-progress.json")
+
+	// Initialize our “last upload” markers
+	lastUploadTime := time.Now()
+	var lastProgress float64 = 0
+
+	for {
+		time.Sleep(1 * time.Minute)
+
+		if !fileExists(filePath) {
+			log.Info().Msg("dda-progress.json not found; skipping upload check.")
+			continue
+		}
+
+		progressStruct, err := getProgressTableAsJsonFromDDADB()
+		if err != nil {
+			log.Error().Err(err).Msg("failed to load progress from DDA DB")
+			continue
+		}
+
+		// Stop monitoring when the scan is done
+		if progressStruct.Status == "Finished" || progressStruct.Status == "Stopped" || progressStruct.Status == "Failed" {
+			log.Info().Msg("DDA scan no longer In Progress; exiting monitor.")
+			break
+		}
+
+		// This is the case where the status is pending or paused or whatever that can be implemented in the future.
+		if progressStruct.Status != "In Progress" {
+			log.Info().Msgf("DDA scan status is not In Progress (%s); skipping upload check.", progressStruct.Status)
+			continue
+		}
+
+		now := time.Now()
+		elapsed := now.Sub(lastUploadTime)
+		deltaPct := progressStruct.Percentage - lastProgress
+
+		// If it’s been ≥30 m *or* we’ve jumped ≥5% since last upload…
+		if elapsed >= 30*time.Minute || deltaPct >= 5 {
+			log.Info().
+				Msgf("Triggering upload (elapsed=%v, progress+%.2f%%)", elapsed, deltaPct)
+
+			if err := compressAndUploadSensitiveData(scanID); err != nil {
+				log.Error().
+					Err(err).
+					Msg("error compressing/uploading sensitive data while monitoring DDA progress")
+				// don’t reset markers on failure; try again next cycle
+			} else {
+				// success → reset our timers
+				lastUploadTime = now
+				lastProgress = progressStruct.Percentage
+			}
 		}
 	}
 }
