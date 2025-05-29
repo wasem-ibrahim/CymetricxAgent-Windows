@@ -7005,6 +7005,10 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 		}
 	}
 
+	if err := fetchAndSaveDDAConfigurations(scanID, endPointName); err != nil {
+		return err
+	}
+
 	isDDAProcessRunning, err := isDDARunning()
 	if err != nil {
 		return fmt.Errorf("error checking if DDA is running: %w", err)
@@ -7019,10 +7023,6 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 	err = saveCurrentScanID(scanID)
 	if err != nil {
 		return fmt.Errorf("failed to save current scan ID: %w", err)
-	}
-
-	if err := fetchAndSaveDDAConfigurations(scanID, endPointName); err != nil {
-		return err
 	}
 
 	go monitorProgressFileAndUploadProgress(scanID)
@@ -7136,9 +7136,7 @@ func isDDARunning() (bool, error) {
 func fetchAndSaveDDAConfigurations(scanID int, endPointName string) error {
 	var apiEndPoint string
 	// if update {
-	if endPointName == "update" {
-		apiEndPoint = fmt.Sprintf("data-discovery/update-configuration/%s/%d", id, scanID)
-	} else if endPointName == "get" {
+	if endPointName == "get" {
 		apiEndPoint = fmt.Sprintf("data-discovery/get-configuration/%s/%d", id, scanID)
 	} else if endPointName == "incidents" {
 		apiEndPoint = fmt.Sprintf("data-discovery/get-configuration-incidents/%s/%d", id, scanID)
@@ -7174,8 +7172,14 @@ func monitorProgressFileAndUploadProgress(scanID int) {
 		lastModTime = info.ModTime()
 	}
 
+	uploadedFirstTime := false
+
 	for {
-		time.Sleep(3 * time.Minute)
+		if uploadedFirstTime {
+			time.Sleep(10 * time.Second)
+		} else {
+			time.Sleep(3 * time.Minute)
+		}
 		// time.Sleep(3 * time.Second)
 
 		info, err := os.Stat(filePath)
@@ -7213,7 +7217,10 @@ func monitorProgressFileAndUploadProgress(scanID int) {
 
 		if err := uploadProgressData(scanID, nil); err != nil {
 			log.Error().Err(err).Msg("uploadProgressData")
+			continue
 		}
+
+		uploadedFirstTime = true
 	}
 }
 
@@ -12653,10 +12660,10 @@ type ApiRealTimeRedisResponse struct {
 	DdaScanUpdate     bool   `json:"ddascanupdate"`
 	DdaScanNewVersion string `json:"ddascannewversion"`
 
-	DdaScan              bool `json:"ddaScan"`              // Call the DDA agent
-	DdaScanIncidents     bool `json:"ddaScanIncidents"`     // Call the DDA agent with incidents
-	ScanID               int  `json:"scanID"`               // The ID of the scan to call the DDA agent
-	DdaScanConfiguration bool `json:"ddaScanConfiguration"` // Call the DDA agent with the configuration
+	DdaScan bool `json:"ddaScan"` // Call the DDA agent
+	// DdaScanConfiguration bool `json:"ddaScanConfiguration"` // Call the DDA agent with the configuration
+	DdaScanIncidents bool `json:"ddaScanIncidents"` // Call the DDA agent with incidents
+	ScanID           int  `json:"scanID"`           // The ID of the scan to call the DDA agent
 }
 
 func initRedis(iniData ini.IniConfig) *redis.Client {
@@ -12868,13 +12875,13 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 		go runDDAScanAndUploadItsOutput(responseBody.ScanID, "incidents")
 	}
 
-	if responseBody.DdaScanConfiguration {
-		// go runDDAScanAndUploadItsOutput(responseBody.ScanID)
+	// if responseBody.DdaScanConfiguration {
+	// 	// go runDDAScanAndUploadItsOutput(responseBody.ScanID)
 
-		if err := fetchAndSaveDDAConfigurations(responseBody.ScanID, "update"); err != nil {
-			log.Error().Err(err).Msg("Failed to fetch and save DDA configurations after getting signal to update it.")
-		}
-	}
+	// 	if err := fetchAndSaveDDAConfigurations(responseBody.ScanID, "update"); err != nil {
+	// 		log.Error().Err(err).Msg("Failed to fetch and save DDA configurations after getting signal to update it.")
+	// 	}
+	// }
 
 	if responseBody.Recheckin {
 		if err := sendAckToRedisServer(rdb, "recheck_received", nil, nil); err != nil {
