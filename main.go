@@ -7025,7 +7025,7 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 		return fmt.Errorf("failed to save current scan ID: %w", err)
 	}
 
-	go monitorProgressFileAndUploadProgress(scanID)
+	go monitorProgressFileAndUploadProgress(scanID, false)
 	go monitorProgressFileAndUploadDDASensitiveData(scanID)
 
 	ddaError := execCommandWithoutOutput(cmdPath, "/c", ddaPath)
@@ -7150,20 +7150,27 @@ func fetchAndSaveDDAConfigurations(scanID int, endPointName string) error {
 		return fmt.Errorf("error in getting configurations for DDA scan: %w", err)
 	}
 
+	// Call it with callOnce = true to avoid multiple calls,
+	// This to tell the server the status after getting the configurations
+	go monitorProgressFileAndUploadProgress(scanID, true)
+
 	// Create the json file that the cyscan will use.
 	jsonFilePath := filepath.Join(CymetricxPath, "dda-configurations.json")
 	if err = createFileWithPermissionsAndWriteToIt(jsonFilePath, configurationsJson.String(), 0644); err != nil {
 		return fmt.Errorf("error in creating file and writing to it: %w", err)
 	}
+
 	return nil
 }
 
-func monitorProgressFileAndUploadProgress(scanID int) {
+func monitorProgressFileAndUploadProgress(scanID int, callOnce bool) {
 	defer catchPanic()
 
 	log.Info().Msg("Starting to monitor dda-progress.json file for changes...")
 
 	filePath := filepath.Join(CymetricxPath, "dda-progress.json")
+
+	nowTime := time.Now()
 
 	// If the file already exists, seed lastModTime so
 	// we don't treat the very first check as a "change".
@@ -7172,11 +7179,11 @@ func monitorProgressFileAndUploadProgress(scanID int) {
 		lastModTime = info.ModTime()
 	}
 
-	uploadedFirstTime := false
-
 	for {
-		if uploadedFirstTime {
-			time.Sleep(10 * time.Second)
+		// This is used to update the server only once immediately after the
+		// dda-progress.json file is created or modified.
+		if callOnce {
+			time.Sleep(5 * time.Second)
 		} else {
 			time.Sleep(3 * time.Minute)
 		}
@@ -7215,12 +7222,21 @@ func monitorProgressFileAndUploadProgress(scanID int) {
 			break
 		}
 
+		if callOnce && nowTime.After(modTime) {
+			// If it was modified before the time right now, then we don't update the server
+			// becuase this might be an old dda-progress.json file.
+			continue
+		}
+
 		if err := uploadProgressData(scanID, nil); err != nil {
 			log.Error().Err(err).Msg("uploadProgressData")
 			continue
 		}
 
-		uploadedFirstTime = true
+		if callOnce {
+			break
+		}
+
 	}
 }
 
@@ -7384,7 +7400,7 @@ func uploadProgressData(scanID int, ddaError error) error {
 
 	percentageCompleted := progressStruct.Percentage
 
-	log.Info().Msgf("DDA scan progress: %d%%", percentageCompleted)
+	log.Info().Msgf("DDA scan progress: %.2f%% completed", percentageCompleted)
 
 	if ddaError != nil {
 		// If dda failed, then set the status to Failed to tell sever that i failed
