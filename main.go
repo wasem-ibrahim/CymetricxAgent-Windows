@@ -7186,6 +7186,7 @@ func monitorProgressFileAndUploadProgress(scanID int, callOnce bool) {
 			time.Sleep(5 * time.Second)
 		} else {
 			time.Sleep(3 * time.Minute)
+			// time.Sleep(30 * time.Second)
 		}
 		// time.Sleep(3 * time.Second)
 
@@ -7211,6 +7212,12 @@ func monitorProgressFileAndUploadProgress(scanID int, callOnce bool) {
 			filePath, prev, modTime,
 		)
 
+		if callOnce && nowTime.After(modTime) {
+			// If it was modified before the time right now, then we don't update the server
+			// becuase this might be an old dda-progress.json file.
+			continue
+		}
+
 		// Retrieve progress data as JSON.
 		progressStruct, err := getProgressTableAsJsonFromDDADB()
 		if err != nil {
@@ -7220,12 +7227,6 @@ func monitorProgressFileAndUploadProgress(scanID int, callOnce bool) {
 		if progressStruct.Status == "Failed" || progressStruct.Status == "Stopped" || progressStruct.Status == "Finished" {
 			log.Info().Msgf("DDA scan status is %s; stopping monitoring.", progressStruct.Status)
 			break
-		}
-
-		if callOnce && nowTime.After(modTime) {
-			// If it was modified before the time right now, then we don't update the server
-			// becuase this might be an old dda-progress.json file.
-			continue
 		}
 
 		if err := uploadProgressData(scanID, nil); err != nil {
