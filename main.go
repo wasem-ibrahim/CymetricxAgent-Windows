@@ -6991,6 +6991,11 @@ func runCyscanAndUploadItsOutput(jsonFileContent string) (err error) {
 	return nil
 }
 
+var (
+	ddaRunMu   sync.Mutex
+	ddaRunning bool
+)
+
 func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 	defer catchPanic()
 	defer logError(&err, "Error in runDDAScanAndUploadItsOutput")
@@ -7009,15 +7014,34 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 		return err
 	}
 
-	isDDAProcessRunning, err := isDDARunning()
-	if err != nil {
-		return fmt.Errorf("error checking if DDA is running: %w", err)
-	}
+	// isDDAProcessRunning, err := isDDARunning()
+	// if err != nil {
+	// 	return fmt.Errorf("error checking if DDA is running: %w", err)
+	// }
 
-	if isDDAProcessRunning {
-		log.Info().Msg("DDA scan is already running. Skipping the execution.")
+	// if isDDAProcessRunning {
+	// 	log.Info().Msg("DDA scan is already running. Skipping the execution.")
+	// 	return nil
+	// }
+
+	// 1) Check if dda.exe is already running:
+	ddaRunMu.Lock()
+	if ddaRunning {
+		ddaRunMu.Unlock()
+		log.Info().Msg("dda.exe is already running; skipping duplicate run")
 		return nil
 	}
+	// Mark “running”:
+	ddaRunning = true
+	ddaRunMu.Unlock()
+
+	// 2) Ensure that, once this function exits (either normally or via error),
+	//    we reset `ddaRunning = false`.
+	defer func() {
+		ddaRunMu.Lock()
+		ddaRunning = false
+		ddaRunMu.Unlock()
+	}()
 
 	// Save the scan ID for recovery in case of unexpected exit
 	err = saveCurrentScanID(scanID)
@@ -7412,6 +7436,12 @@ func uploadProgressData(scanID int, ddaError error) error {
 	progressStructBytes, err := json.Marshal(progressStruct)
 	if err != nil {
 		return fmt.Errorf("error while marshalling progress struct to JSON: %w", err)
+	}
+
+	// Update dda-progress.json file with the current progress.
+	progressFilePath := filepath.Join(CymetricxPath, "dda-progress.json")
+	if err := createFileWithPermissionsAndWriteToItRaw(progressFilePath, progressStructBytes, 0644); err != nil {
+		return fmt.Errorf("error in creating file and writing to it: %w", err)
 	}
 
 	// Build endpoint for uploading progress data.
