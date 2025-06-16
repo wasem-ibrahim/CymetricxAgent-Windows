@@ -991,7 +991,7 @@ func createAgentDirectories() {
 	log.Info().Msg("Starting the creation of agent directories...")
 
 	// List of directories to check for their existence and create them if they don't exist.
-	dirs := []string{"Hash Files", "Compressed Files", "Time Files", "Agent Files", "Controls"}
+	dirs := []string{"Hash Files", "Compressed Files", "Time Files", "Agent Files", "Controls", "DDA"}
 
 	for _, dir := range dirs {
 		dir = filepath.Join(CymetricxPath, dir)
@@ -7177,11 +7177,221 @@ func fetchAndSaveDDAConfigurations(scanID int, endPointName string) error {
 	// Call it with callOnce = true to avoid multiple calls,
 	// This to tell the server the status after getting the configurations
 	go monitorProgressFileAndUploadProgress(scanID, true)
-
 	// Create the json file that the cyscan will use.
 	jsonFilePath := filepath.Join(CymetricxPath, "dda-configurations.json")
 	if err = createFileWithPermissionsAndWriteToIt(jsonFilePath, configurationsJson.String(), 0644); err != nil {
 		return fmt.Errorf("error in creating file and writing to it: %w", err)
+	}
+
+	return nil
+}
+
+// ddaListResponse matches the JSON from GET /dataDiscovery/DDA-list
+type ddaListResponse struct {
+	Files    []string `json:"files"`
+	Folders  []string `json:"folders"`
+	RegexIDs []int    `json:"regexIDs"`
+}
+
+// Orchestrator
+func deleteDdaRecords(scanID int) error {
+	log.Info().Msgf("Deleting DDA records for scan ID %d …", scanID)
+
+	payload, err := fetchDdaList(scanID)
+	if err != nil {
+		return err
+	}
+
+	wasRunning, err := ensureAgentPaused()
+	if err != nil {
+		return err
+	}
+	defer func() { resumeAgentIfNeeded(wasRunning) }()
+
+	dbPath := filepath.Join(CymetricxPath, "dda.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return fmt.Errorf("open sqlite3 db: %w", err)
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	if err = bulkDeleteExactPaths(tx, "SensitiveData", payload.Files); err != nil {
+		return err
+	}
+	if err = bulkDeleteExactPaths(tx, "ScannedFiles", payload.Files); err != nil {
+		return err
+	}
+
+	if err = bulkDeleteFolderPrefixes(tx, "SensitiveData", payload.Folders); err != nil {
+		return err
+	}
+	if err = bulkDeleteFolderPrefixes(tx, "ScannedFiles", payload.Folders); err != nil {
+		return err
+	}
+
+	if err = bulkDeleteRegexPaths(tx, payload.RegexIDs); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	log.Info().Msg("DDA records deletion complete.")
+	return nil
+}
+
+// 1. Fetch the JSON payload from your API
+func fetchDdaList(scanID int) (*ddaListResponse, error) {
+	endpoint := fmt.Sprintf("data-discovery/delete-data-discovery/%s/%d", id, scanID)
+	body, err := prepareAndExecuteHTTPRequestWithTokenValidityV2("GET", endpoint, nil, 10)
+	if err != nil {
+		return nil, fmt.Errorf("fetch DDA list: %w", err)
+	}
+	var payload ddaListResponse
+	if err := json.Unmarshal(body.Bytes(), &payload); err != nil {
+		return nil, fmt.Errorf("decode DDA list JSON: %w", err)
+	}
+	return &payload, nil
+}
+
+// 2. Pause the agent if it’s running; return true if we paused it
+func ensureAgentPaused() (bool, error) {
+	running, err := isDDARunning()
+	if err != nil {
+		return false, fmt.Errorf("check DDA running: %w", err)
+	}
+	if !running {
+		return false, nil
+	}
+
+	cfgPath := filepath.Join(CymetricxPath, "dda-configurations.json")
+	cfg, err := readDDAConfigurationsFromFile()
+	if err != nil {
+		return false, fmt.Errorf("read config: %w", err)
+	}
+	cfg.ScanStatus = "PAUSE-NO-NOTIFY"
+
+	raw, _ := json.Marshal(cfg)
+	if err := createFileWithPermissionsAndWriteToItRaw(cfgPath, raw, 0644); err != nil {
+		return false, fmt.Errorf("write config: %w", err)
+	}
+	return true, nil
+}
+
+// 3. Resume the agent if we paused it
+func resumeAgentIfNeeded(wasRunning bool) {
+	if !wasRunning {
+		return
+	}
+	cfgPath := filepath.Join(CymetricxPath, "dda-configurations.json")
+	cfg, err := readDDAConfigurationsFromFile()
+	if err != nil {
+		log.Error().Err(err).Msg("read config for resume")
+		return
+	}
+	cfg.ScanStatus = "RESUME-NO-NOTIFY"
+
+	raw, _ := json.Marshal(cfg)
+	if err := createFileWithPermissionsAndWriteToItRaw(cfgPath, raw, 0644); err != nil {
+		log.Error().Err(err).Msg("write config for resume")
+	}
+}
+
+// 4a. Bulk‐delete exact Paths from a table
+func bulkDeleteExactPaths(tx *sql.Tx, table string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	ph := make([]string, len(paths))
+	args := make([]interface{}, len(paths))
+	for i, p := range paths {
+		ph[i] = "?"
+		args[i] = p
+	}
+	query := fmt.Sprintf(
+		"DELETE FROM %s WHERE Path IN (%s)",
+		table, strings.Join(ph, ","),
+	)
+	if _, err := tx.Exec(query, args...); err != nil {
+		return fmt.Errorf("bulk delete from %s: %w", table, err)
+	}
+	return nil
+}
+
+// 4b. Bulk‐delete folder prefixes via OR‐joined LIKE
+func bulkDeleteFolderPrefixes(tx *sql.Tx, table string, folders []string) error {
+	if len(folders) == 0 {
+		return nil
+	}
+	clauses := make([]string, len(folders))
+	args := make([]interface{}, len(folders))
+	for i, f := range folders {
+		clauses[i] = "Path LIKE ?"
+		args[i] = f + "%"
+	}
+	query := fmt.Sprintf(
+		"DELETE FROM %s WHERE %s",
+		table, strings.Join(clauses, " OR "),
+	)
+	if _, err := tx.Exec(query, args...); err != nil {
+		return fmt.Errorf("bulk delete folders from %s: %w", table, err)
+	}
+	return nil
+}
+
+// 4c. Fetch DISTINCT Paths by RegexID, then bulk‐delete them
+func bulkDeleteRegexPaths(tx *sql.Tx, regexIDs []int) error {
+	if len(regexIDs) == 0 {
+		return nil
+	}
+
+	// 4c-i: collect file paths
+	ph := make([]string, len(regexIDs))
+	args := make([]interface{}, len(regexIDs))
+	for i, id := range regexIDs {
+		ph[i] = "?"
+		args[i] = id
+	}
+	query := fmt.Sprintf(
+		"SELECT DISTINCT Path FROM SensitiveData WHERE RegexID IN (%s)",
+		strings.Join(ph, ","),
+	)
+
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return fmt.Errorf("query regex paths: %w", err)
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return fmt.Errorf("scan regex path: %w", err)
+		}
+		paths = append(paths, p)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate regex rows: %w", err)
+	}
+
+	// 4c-ii: delete them from both tables
+	if err := bulkDeleteExactPaths(tx, "SensitiveData", paths); err != nil {
+		return err
+	}
+	if err := bulkDeleteExactPaths(tx, "ScannedFiles", paths); err != nil {
+		return err
 	}
 
 	return nil
@@ -7499,6 +7709,53 @@ func getProgressTableAsJsonFromDDADB() (DdaProgress, error) {
 	}
 
 	return progress, nil
+}
+
+type DdaConfigurations struct {
+	Status                           int
+	ScanStatus                       string
+	TimeOutInSeconds                 int
+	ConnectedToPower                 bool
+	MaxFileSizeInMegaBytes           int
+	MaxFileSizeCompressedInMegaBytes int
+	ChunckSizeInMegaBytes            int
+	Resources                        struct {
+		MaxCPU    string
+		MaxMemory string
+	}
+	RegexPolicies []struct {
+		ID                 int
+		Name               string
+		RegexPattern       string
+		ValidateCreditCard bool
+	}
+	PathsPolicy struct {
+		MaxDepth    int
+		FilesPolicy struct {
+			Included []string
+			Excluded []string
+		}
+		ExtensionsPolicy struct {
+			Included []string
+			Excluded []string
+		}
+	}
+}
+
+func readDDAConfigurationsFromFile() (DdaConfigurations, error) {
+	configFilePath := filepath.Join(CymetricxPath, "dda-configurations.json")
+	var configurations DdaConfigurations
+	jsonContent, err := os.ReadFile(configFilePath)
+	if err != nil {
+		return DdaConfigurations{}, fmt.Errorf("error reading DDA configurations file: %w", err)
+	}
+
+	jsonContent = bytes.TrimSpace(jsonContent)
+	if err := json.Unmarshal(jsonContent, &configurations); err != nil {
+		return DdaConfigurations{}, fmt.Errorf("error unmarshalling DDA configurations JSON: %w", err)
+	}
+
+	return configurations, nil
 }
 
 // exportTableToCSV opens an SQLite3 database from dbPath, queries all rows from tableName,
@@ -12711,6 +12968,8 @@ type ApiRealTimeRedisResponse struct {
 	// DdaScanConfiguration bool `json:"ddaScanConfiguration"` // Call the DDA agent with the configuration
 	DdaScanIncidents bool `json:"ddaScanIncidents"` // Call the DDA agent with incidents
 	ScanID           int  `json:"scanID"`           // The ID of the scan to call the DDA agent
+
+	DdaDelete bool `json:"ddaDelete"`
 }
 
 func initRedis(iniData ini.IniConfig) *redis.Client {
@@ -12920,6 +13179,12 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 
 	if responseBody.DdaScanIncidents {
 		go runDDAScanAndUploadItsOutput(responseBody.ScanID, "incidents")
+	}
+
+	if responseBody.DdaDelete {
+		if err := deleteDdaRecords(responseBody.ScanID); err != nil {
+			log.Error().Err(err).Msg("Failed to delete DDD list.")
+		}
 	}
 
 	// if responseBody.DdaScanConfiguration {
@@ -14824,7 +15089,7 @@ func getControlHandlers() map[string]func(map[string]string, map[string]string) 
 	return map[string]func(map[string]string, map[string]string) (map[string]string, error){
 		"PASSWORD_POLICY":          controls.GetPasswordPolicy,
 		"REGISTRY_SETTING":         controls.GetRegistrySetting,
-		"LOCKOUT_POLICY":           controls.GetLockouPolicy,
+		"LOCKOUT_POLICY":           controls.GetLockoutPolicy,
 		"AUDIT_POLICY_SUBCATEGORY": controls.GetAuditPolicySubcategory,
 		"REG_CHECK":                controls.GetRegCheck,
 		"USER_RIGHTS_POLICY":       controls.GetUserRightsPolicy,

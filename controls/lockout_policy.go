@@ -78,7 +78,7 @@ func Mainlo() {
 }
 
 // Handler functions for different types
-func GetLockouPolicy(obj map[string]string, variables map[string]string) (map[string]string, error) {
+func GetLockoutPolicy(obj map[string]string, variables map[string]string) (map[string]string, error) {
 	valueType := obj["value_type"]
 	valueData := obj["value_data"]
 	lockoutPolicy := obj["lockout_policy"]
