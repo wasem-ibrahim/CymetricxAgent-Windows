@@ -204,7 +204,7 @@ var minimalMonitoringInterval = 10 // In minutes (10 minutes)
 var maximalMonitoringInterval = 15 // In minutes (20 minutes)
 var timeUSN = 60                   // In minutes (60 minutes)
 
-func main() {
+func main1() {
 
 	// Catch any panic and logs it with its stack trace.
 	defer catchAndRestartPanicForFunction(main)
@@ -599,6 +599,12 @@ func getCMDandPowerShellPaths() (string, string) {
 func getCMDPath() string {
 	log.Info().Msg("Attempting to find cmd path...")
 
+	// check for default path first if it exists, otherwise use LookPath to find it in the PATH environment variable.
+	if fileExists("C:\\Windows\\System32\\cmd.exe") {
+		log.Info().Msg("Using default cmd path: C:\\Windows\\System32\\cmd.exe")
+		return "C:\\Windows\\System32\\cmd.exe"
+	}
+
 	// Check if cmd.exe exists in the System32 directory. If it does, use that path. Otherwise, use "cmd"
 	// which will use the cmd.exe in the PATH environment variable.
 	cmdFilePath, err := exec.LookPath("cmd")
@@ -619,6 +625,12 @@ func getCMDPath() string {
 func getPowerShellPath() string {
 	log.Info().Msg("Attempting to find powershell path...")
 
+	// check for default path first if it exists, otherwise use LookPath to find it in the PATH environment variable.
+	if fileExists("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe") {
+		log.Info().Msg("Using default powershell path: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+		return "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+	}
+
 	// Check if powershell.exe exists in the System32 directory. If it does, use that path. Otherwise, use "powershell"
 	// which will use the powershell.exe in the PATH environment variable.
 	powerShellFilePath, err := exec.LookPath("powershell")
@@ -635,12 +647,34 @@ func getPowerShellPath() string {
 // uninstallOldAgentWithItsPackagesAndServices uninstalls any old agent that
 // might exist on the system with all of its packages and services.
 func uninstallOldAgentWithItsPackagesAndServices() {
-	if err := uninstallOldAgentServicesAndPackages(); err != nil {
-		log.Error().Err(err).Msg("Failed to uninstall old agent.")
-		//! Should we exit here if there was an old version and we couldn't uninstall it?
+	versionFilePath := filepath.Join(CymetricxPath, "VersionFile.txt")
+	if !fileExists(versionFilePath) {
+		log.Info().Msg("VersionFile.txt not found. No old agent to uninstall.")
+		return
 	}
 
-	//! Do we get any error output from the previous function telling that it did not work so i'd know that i need to skip these two functions below?
+	// If the VersionFile.txt does not exist, it means that this is a fresh install and there is no need to uninstall anything.
+	// Ex: CYMETRICX  1.4.119
+	versionRaw, err := os.ReadFile(versionFilePath)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to read VersionFile.txt.")
+		return
+	}
+
+	// E.g CYMETRICX  1.4.119
+	version := strings.TrimSpace(string(versionRaw))
+
+	// Mind the double space between the version and the version number.
+	if version >= "CYMETRICX  "+AgentVersion {
+		log.Info().Msg("Current agent version matches the version in VersionFile.txt. Skipping uninstallation.")
+		return
+	}
+
+	// E.g CYMETRICX  1.4.119
+	if err := uninstallOldAgentServicesAndPackages(version); err != nil {
+		log.Error().Err(err).Msg("Failed to uninstall old agent.")
+	}
+
 	// The previous function didn't work on some systems to uninstall the old agent's services and packages.
 	// So we need to run these functions to uninstall the old agent's services and packages  as a backup in those cases.
 	uninstallOldCymetricxPackagesBackup()
@@ -650,34 +684,8 @@ func uninstallOldAgentWithItsPackagesAndServices() {
 // uninstallOldAgentServicesAndPackages is responsible for uninstalling older versions of the cymetricx agent if they exist.
 // It removes the old agent directory inside of the CYMETRICX director,
 // stops and deletes the old agent service, and uninstalls the old agent package.
-func uninstallOldAgentServicesAndPackages() error {
+func uninstallOldAgentServicesAndPackages(version string) error {
 	log.Info().Msg("Starting to uninstall the old cymetricx agent...")
-
-	versionFilePath := filepath.Join(CymetricxPath, "VersionFile.txt")
-
-	// If the VersionFile.txt does not exist, it means that this is a fresh install and there is no need to uninstall anything.
-	// Ex: CYMETRICX  1.4.119
-	if !fileExists(versionFilePath) {
-		log.Info().Msg("VersionFile.txt not found. No old agent to uninstall.")
-		return nil
-	}
-
-	// Read the version from the VersionFile.txt.
-	versionRaw, err := os.ReadFile(versionFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to read VersionFile.txt: %w", err)
-	}
-
-	// E.g CYMETRICX  1.4.119
-	version := strings.TrimSpace(string(versionRaw))
-
-	// Mind the double space between the version and the version number.
-	if version == "CYMETRICX  "+AgentVersion {
-		log.Info().Msg("Current agent version matches the version in VersionFile.txt. Skipping uninstallation.")
-		return nil
-	}
-
-	log.Info().Str("OldVersion", version).Msg("Detected old agent version. Preparing to uninstall.")
 
 	// Create the uninstall script.
 	uninstallScript := createScriptToDeleteServicesAndUninstallOldAgent(version)
@@ -688,7 +696,7 @@ func uninstallOldAgentServicesAndPackages() error {
 	}
 
 	// Remove the old agent directory e.g. C:\Program Files\CYMETRICX\CYMETRICX 1.4.119
-	if err = os.RemoveAll(version); err != nil {
+	if err := os.RemoveAll(version); err != nil {
 		return fmt.Errorf("error removing old agent directory %s because of: %w", version, err)
 	}
 
@@ -890,7 +898,7 @@ func deletePreviousAgentEntries() {
 
 	// Call the function to delete files with specific extentions from the
 	// cymetricx directory.
-	delteCymetricxFilesWithExtentions(cymetricxEntries, extensionsToDelete)
+	deleteCymetricxFilesWithExtentions(cymetricxEntries, extensionsToDelete)
 
 	// Call the function to delete specific entries that existed in
 	// the old agents or must be removed before the agent starts.
@@ -903,7 +911,7 @@ func deletePreviousAgentEntries() {
 // that either have specific extensions or include "time.txt" in their names.
 // The function accepts a slice of directory entries to inspect and a list of
 // target extensions.
-func delteCymetricxFilesWithExtentions(cymetricxEntries []fs.DirEntry, extensionsToDelete []string) {
+func deleteCymetricxFilesWithExtentions(cymetricxEntries []fs.DirEntry, extensionsToDelete []string) {
 
 	// Create a set of file extensions to delete for efficient lookup.
 	// Since Go doesn't have a built-in set data structure, we use a map with empty
@@ -962,6 +970,9 @@ func removeListOfSpecificEntries() {
 		"realservice.csv",
 		"Applications.ps1",
 		"process_service_w.db",
+		"dda.db",
+		"dda-configurations.json",
+		"dda-progress.json",
 	}
 
 	// Loop through the list of files and directories to remove them using os.RemoveAll since some of them are directories.
@@ -991,11 +1002,15 @@ func createAgentDirectories() {
 	log.Info().Msg("Starting the creation of agent directories...")
 
 	// List of directories to check for their existence and create them if they don't exist.
-	dirs := []string{"Hash Files", "Compressed Files", "Time Files", "Agent Files", "Controls", "DDA"}
+	dirs := []string{"Hash Files", "Compressed Files", "Time Files", "Agent Files", "Controls", "DDA-Scans"}
 
 	for _, dir := range dirs {
 		dir = filepath.Join(CymetricxPath, dir)
-		createDirectoryWithPermissions(dir, 0755)
+		if err := createDirectoryWithPermissions(dir, 0755); err != nil {
+			// Exit if any directory fails to be created since directories are
+			// essential for the agent to run.
+			log.Fatal().Err(err).Msgf("Failed to create directory: %s", dir)
+		}
 	}
 
 	log.Info().Msg("Finished the creation of agent directories.")
@@ -1003,17 +1018,14 @@ func createAgentDirectories() {
 
 // createDirectoryWithPermissions creates the provided directory if it does not
 // exist and gives it the provided permissions.
-func createDirectoryWithPermissions(dir string, permissions os.FileMode) {
+func createDirectoryWithPermissions(dir string, permissions os.FileMode) error {
 
 	// Only create the directory if it does not exist.
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
 
-		// Create the directory.
-		if err := os.Mkdir(dir, permissions); err != nil {
-
-			// Exit if any directory fails to be created since directories are
-			// essential for the agent to run.
-			log.Fatal().Err(err).Msgf("Failed to create directory: %s", dir)
+		// Create the directory and all its parent directories if they do not exist.
+		if err := os.MkdirAll(dir, permissions); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 
 		// The following code only applies on Unix systems.
@@ -1023,12 +1035,13 @@ func createDirectoryWithPermissions(dir string, permissions os.FileMode) {
 		// doesn't respect the umask. This adjustment prevents the application from
 		// assigning potentially insecure default permissions when creating the directory.
 		if err := os.Chmod(dir, permissions); err != nil {
-			log.Error().Err(err).Msgf("Failed to change permissions of directory: %s", dir)
-			return
+			return fmt.Errorf("failed to change permissions of directory %s: %w", dir, err)
 		}
 
 		log.Info().Msgf("Successfully created directory: %s", dir)
 	}
+
+	return nil
 }
 
 func createNewAgentFilesAndCopyOldDataToThem() {
@@ -2988,6 +3001,67 @@ func execCommandWithoutOutput(command string, args ...string) error {
 
 	return nil
 }
+
+// execCommandWithoutOutput runs the specified command along with its arguments.
+// If the command execution fails, it captures the standard error output and
+// includes it in the returned error.
+// This version allows specifying a specific directory for the command to run in.
+func execCommandWithoutOutputInDirectory(command string, parentDirectory string, args ...string) error {
+	// Create a buffer to store the error output of the command.
+	var stderr bytes.Buffer
+
+	// Create a new command with the specified command and args.
+	cmd := exec.Command(command, args...)
+
+	// Set the stderr of the command to the stderr buffer.
+	// So, if there is an error, it will be stored in the stderr buffer.
+	cmd.Stderr = &stderr
+
+	// Set the working directory for the command to run in.
+	// This means that the binary would see its parent directory as the specified dir.
+	// This is useful when using "./" pathing inside of the run binary.
+	// Ex: dda.exe when run would see itself as if it was in the parentDirectory passed.
+	cmd.Dir = parentDirectory
+
+	// Execute the command using Run().
+	// Run() is used here instead of Output() because we do not need to capture
+	// the standard output of the command, only its error output if it exists.
+	err := cmd.Run()
+	if err != nil {
+		// Using strings.Join for better formatting of args.
+		// Format and return the error with the command, arguments, and captured stderr.
+		return fmt.Errorf("could not execute command: %s, args: %s, Stderr: %s, error: %w", command, strings.Join(args, " "), stderr.String(), err)
+	}
+
+	return nil
+}
+
+// // execCommandWithoutOutput runs the specified command along with its arguments.
+// // If the command execution fails, it captures the standard error output and
+// // includes it in the returned error.
+// func execCommandWithoutOutput(command string, args ...string) error {
+// 	// Create a buffer to store the error output of the command.
+// 	var stderr bytes.Buffer
+
+// 	// Create a new command with the specified command and args.
+// 	cmd := exec.Command(command, args...)
+
+// 	// Set the stderr of the command to the stderr buffer.
+// 	// So, if there is an error, it will be stored in the stderr buffer.
+// 	cmd.Stderr = &stderr
+
+// 	// Execute the command using Run().
+// 	// Run() is used here instead of Output() because we do not need to capture
+// 	// the standard output of the command, only its error output if it exists.
+// 	err := cmd.Run()
+// 	if err != nil {
+// 		// Using strings.Join for better formatting of args.
+// 		// Format and return the error with the command, arguments, and captured stderr.
+// 		return fmt.Errorf("could not execute command: %s, args: %s, Stderr: %s, error: %w", command, strings.Join(args, " "), stderr.String(), err)
+// 	}
+
+// 	return nil
+// }
 
 // stopAndRemoveRunRecoveryService stops and removes the runrecovery service
 func stopAndRemoveRunRecoveryService() {
@@ -6991,9 +7065,14 @@ func runCyscanAndUploadItsOutput(jsonFileContent string) (err error) {
 	return nil
 }
 
+type ddaRunMuStruct struct {
+	DdaRunMu   sync.Mutex
+	DdaRunning bool
+}
+
 var (
-	ddaRunMu   sync.Mutex
-	ddaRunning bool
+	ddaRunMuList   = make(map[int]*ddaRunMuStruct)
+	ddaRunMuListMu sync.Mutex
 )
 
 func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
@@ -7010,60 +7089,77 @@ func runDDAScanAndUploadItsOutput(scanID int, endPointName string) (err error) {
 		}
 	}
 
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+	if err := createDirectoryWithPermissions(DDAScanIDPath, 0755); err != nil {
+		return fmt.Errorf("error in creating DDA scan directory: %w", err)
+	}
+
 	if err := fetchAndSaveDDAConfigurations(scanID, endPointName); err != nil {
 		return err
 	}
 
-	// isDDAProcessRunning, err := isDDARunning()
-	// if err != nil {
-	// 	return fmt.Errorf("error checking if DDA is running: %w", err)
-	// }
+	// 1) safely get-or-create the per-scanID struct
+	ddaRunMuListMu.Lock()
+	muStruct, exists := ddaRunMuList[scanID]
+	if !exists {
+		muStruct = &ddaRunMuStruct{}
+		ddaRunMuList[scanID] = muStruct
+	}
+	ddaRunMuListMu.Unlock()
 
-	// if isDDAProcessRunning {
-	// 	log.Info().Msg("DDA scan is already running. Skipping the execution.")
-	// 	return nil
-	// }
-
-	// 1) Check if dda.exe is already running:
-	ddaRunMu.Lock()
-	if ddaRunning {
-		ddaRunMu.Unlock()
-		log.Info().Msg("dda.exe is already running; skipping duplicate run")
+	// 2) now lock the *per-scan* mutex to gate ddaRunning
+	muStruct.DdaRunMu.Lock()
+	if muStruct.DdaRunning {
+		muStruct.DdaRunMu.Unlock()
+		log.Info().Msgf("dda.exe is already running; skipping duplicate run for scanID %d", scanID)
 		return nil
 	}
-	// Mark “running”:
-	ddaRunning = true
-	ddaRunMu.Unlock()
+	muStruct.DdaRunning = true
+	muStruct.DdaRunMu.Unlock()
 
-	// 2) Ensure that, once this function exits (either normally or via error),
-	//    we reset `ddaRunning = false`.
+	// 3) defer the reset (under that same per-scan mutex)
 	defer func() {
-		ddaRunMu.Lock()
-		ddaRunning = false
-		ddaRunMu.Unlock()
+		// reset the flag
+		muStruct.DdaRunMu.Lock()
+		muStruct.DdaRunning = false
+		muStruct.DdaRunMu.Unlock()
+
+		// remove from the map so it doesn’t leak
+		ddaRunMuListMu.Lock()
+		delete(ddaRunMuList, scanID)
+		ddaRunMuListMu.Unlock()
 	}()
 
 	// Save the scan ID for recovery in case of unexpected exit
 	err = saveCurrentScanID(scanID)
 	if err != nil {
-		return fmt.Errorf("failed to save current scan ID: %w", err)
+		return fmt.Errorf("failed to save current scan ID %d: %w", scanID, err)
 	}
 
 	go monitorProgressFileAndUploadProgress(scanID, false)
 	go monitorProgressFileAndUploadDDASensitiveData(scanID)
 
-	ddaError := execCommandWithoutOutput(cmdPath, "/c", ddaPath)
+	ddaError := execCommandWithoutOutputInDirectory(
+		cmdPath,
+		DDAScanIDPath,
+		"/c",
+		ddaPath,
+
+		// This is ignored by dda.exe and just added to distinguish different
+		// dda.exe runs in Task Manager when enabling "Command Line" column
+		fmt.Sprintf("--scan-id=%d", scanID),
+	)
 	if ddaError != nil {
 		// return fmt.Errorf("error in executing cyscan command: %w", err)
-		log.Error().Err(ddaError).Msg("Error in executing dda.exe command")
+		log.Error().Err(ddaError).Msgf("Error in executing dda.exe command for scanID %d", scanID)
 	}
 
 	log.Debug().Msg("dda.exe process completed.")
 
 	// Cleanup saved scan ID once finished
-	err = deleteCurrentScanID()
+	err = deleteCurrentScanID(scanID)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to delete saved scan ID file after finishing the scan.")
+		log.Error().Err(err).Msgf("Failed to delete saved scan ID file after finishing the scan %d.", scanID)
 	}
 
 	if err := collectDDADBDataAndCompressAndUploadIt(scanID, ddaError); err != nil {
@@ -7105,15 +7201,25 @@ func checkDDAProgressFile() (string, error) {
 // saveCurrentScanID writes the current scan ID to a file.
 func saveCurrentScanID(scanID int) error {
 	const savedScanIDPath = "dda-scan-id.txt"
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
 
-	savedScanIDFullPath := filepath.Join(CymetricxPath, savedScanIDPath)
+	savedScanIDFullPath := filepath.Join(DDAScanIDPath, savedScanIDPath)
 	return os.WriteFile(savedScanIDFullPath, []byte(fmt.Sprintf("%d", scanID)), 0644)
 }
 
-// getSavedScanID reads the scan ID from the file.
-func getSavedScanID() (int, error) {
+// deleteCurrentScanID removes the saved scan ID file.
+func deleteCurrentScanID(scanID int) error {
 	const savedScanIDPath = "dda-scan-id.txt"
-	savedScanIDFullPath := filepath.Join(CymetricxPath, savedScanIDPath)
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+
+	savedScanIDFullPath := filepath.Join(DDAScanIDPath, savedScanIDPath)
+	return os.Remove(savedScanIDFullPath)
+}
+
+// getSavedScanID reads the scan ID from the file.
+func getSavedScanID(dirPath string) (int, error) {
+	const savedScanIDPath = "dda-scan-id.txt"
+	savedScanIDFullPath := filepath.Join(dirPath, savedScanIDPath)
 
 	data, err := os.ReadFile(savedScanIDFullPath)
 	if err != nil {
@@ -7127,24 +7233,32 @@ func getSavedScanID() (int, error) {
 	return scanID, nil
 }
 
-// deleteCurrentScanID removes the saved scan ID file.
-func deleteCurrentScanID() error {
-	const savedScanIDPath = "dda-scan-id.txt"
-
-	savedScanIDFullPath := filepath.Join(CymetricxPath, savedScanIDPath)
-	return os.Remove(savedScanIDFullPath)
-}
-
 func tryRecoverUnfinishedDDAScan() {
-	scanID, err := getSavedScanID()
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans")
+
+	// Loop over all directories in the DDA-Scans folder
+	dirs, err := os.ReadDir(DDAScanIDPath)
 	if err != nil {
-		// No saved scan ID, nothing to recover
-		log.Debug().Msg("No saved scan ID found, skipping recovery.")
+		log.Error().Err(err).Msg("Failed to read DDA-Scans directory.")
 		return
 	}
 
-	log.Info().Msgf("Recovering unfinished scan with scanID %d...", scanID)
-	go runDDAScanAndUploadItsOutput(scanID, "")
+	for _, dir := range dirs {
+		if !dir.IsDir() {
+			continue // Skip if not a directory
+		}
+
+		dirPath := filepath.Join(DDAScanIDPath, dir.Name())
+		scanID, err := getSavedScanID(dirPath)
+		if err != nil {
+			// No saved scan ID, nothing to recover
+			log.Debug().Msgf("No saved scan ID found in directory %s, skipping.", dirPath)
+			continue
+		}
+
+		log.Info().Msgf("Recovering unfinished scan with scanID %d...", scanID)
+		go runDDAScanAndUploadItsOutput(scanID, "")
+	}
 }
 
 func isDDARunning() (bool, error) {
@@ -7158,6 +7272,8 @@ func isDDARunning() (bool, error) {
 //! DDA Scan related functions
 
 func fetchAndSaveDDAConfigurations(scanID int, endPointName string) error {
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+
 	var apiEndPoint string
 	// if update {
 	if endPointName == "get" {
@@ -7178,7 +7294,7 @@ func fetchAndSaveDDAConfigurations(scanID int, endPointName string) error {
 	// This to tell the server the status after getting the configurations
 	go monitorProgressFileAndUploadProgress(scanID, true)
 	// Create the json file that the cyscan will use.
-	jsonFilePath := filepath.Join(CymetricxPath, "dda-configurations.json")
+	jsonFilePath := filepath.Join(DDAScanIDPath, "dda-configurations.json")
 	if err = createFileWithPermissionsAndWriteToIt(jsonFilePath, configurationsJson.String(), 0644); err != nil {
 		return fmt.Errorf("error in creating file and writing to it: %w", err)
 	}
@@ -7191,24 +7307,35 @@ type ddaListResponse struct {
 	Files    []string `json:"files"`
 	Folders  []string `json:"folders"`
 	RegexIDs []int    `json:"regexIDs"`
+	MD5      []string `json:"md5"`
 }
 
 // Orchestrator
 func deleteDdaRecords(scanID int) error {
 	log.Info().Msgf("Deleting DDA records for scan ID %d …", scanID)
 
-	payload, err := fetchDdaList(scanID)
+	// payload, err := fetchDdaList(scanID)
+	// if err != nil {
+	// 	return err
+	// }
+	// fmt.Println("Payload fetched successfully:", payload)
+
+	// Dummy palyload:
+	payload := &ddaListResponse{
+		MD5: []string{"7506ffe0f5bc9c9053de05a875df9c1f"},
+	}
+
+	wasRunning, err := ensureAgentPaused(scanID)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		resumeAgentIfNeeded(scanID, wasRunning)
+	}()
 
-	wasRunning, err := ensureAgentPaused()
-	if err != nil {
-		return err
-	}
-	defer func() { resumeAgentIfNeeded(wasRunning) }()
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
 
-	dbPath := filepath.Join(CymetricxPath, "dda.db")
+	dbPath := filepath.Join(DDAScanIDPath, "dda.db")
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return fmt.Errorf("open sqlite3 db: %w", err)
@@ -7225,29 +7352,95 @@ func deleteDdaRecords(scanID int) error {
 		}
 	}()
 
-	if err = bulkDeleteExactPaths(tx, "SensitiveData", payload.Files); err != nil {
+	var filePaths []string
+	if err = bulkDeleteExactRecords(tx, "SensitiveData", "Path", payload.Files); err != nil {
 		return err
 	}
-	if err = bulkDeleteExactPaths(tx, "ScannedFiles", payload.Files); err != nil {
-		return err
-	}
-
-	if err = bulkDeleteFolderPrefixes(tx, "SensitiveData", payload.Folders); err != nil {
-		return err
-	}
-	if err = bulkDeleteFolderPrefixes(tx, "ScannedFiles", payload.Folders); err != nil {
+	if err = bulkDeleteExactRecords(tx, "ScannedFiles", "Path", payload.Files); err != nil {
 		return err
 	}
 
-	if err = bulkDeleteRegexPaths(tx, payload.RegexIDs); err != nil {
+	folderFilePaths, err := bulkDeleteLikeRecords(tx, "SensitiveData", "Path", payload.Folders)
+	if err != nil {
+		return err
+	}
+	if _, err = bulkDeleteLikeRecords(tx, "ScannedFiles", "Path", payload.Folders); err != nil {
 		return err
 	}
 
+	regexFilePaths, err := bulkDeleteByValues(tx, "RegexID", payload.RegexIDs)
+	if err != nil {
+		return err
+	}
+
+	md5FilePath, err := bulkDeleteByValues(tx, "MD5", payload.MD5)
+	if err != nil {
+		return err
+	}
+
+	filePaths = append(filePaths, folderFilePaths...)
+	filePaths = append(filePaths, regexFilePaths...)
+	filePaths = append(filePaths, md5FilePath...)
+
+	// Add these deleted file paths to the DeletedFilesToBeScanned table
+	// This is to ensure that the deleted files will be scanned again in the next scan
+	// This is to avoid skipping them because the directories' size haven't chagned.
+	if err := addDeletedFilePathsToDeletedFilesToBeScannedTable(tx, filePaths); err != nil {
+		return fmt.Errorf("add deleted file paths to DeletedFilesToBeScanned table: %w", err)
+	}
+
+	// Commit the transaction
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
 
+	// Vacuum the database to remove deleted records
+	if _, err = db.Exec("VACUUM"); err != nil {
+		return fmt.Errorf("vacuum: %w", err)
+	}
+
 	log.Info().Msg("DDA records deletion complete.")
+	return nil
+}
+
+func deleteDdaFolder(scanID int) error {
+	log.Info().Msgf("Deleting DDA folder for scan ID %d …", scanID)
+
+	// This is a call that is unnecessary for me but important for the server to tell it that
+	// i recieved and im about to start deleting. This funciton is only necessary if i want to
+	// delete records, and not the folder as a whole.
+	_, err := fetchDdaList(scanID)
+	if err != nil {
+		return err
+	}
+
+	if err := ensureAgentStopped(scanID); err != nil {
+		return err
+	}
+
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+
+	muStruct, exists := ddaRunMuList[scanID]
+	if !exists {
+		muStruct = &ddaRunMuStruct{}
+		ddaRunMuList[scanID] = muStruct
+	}
+
+	for {
+		if muStruct.DdaRunning {
+			log.Info().Msgf("Waiting for dda.exe to finish running for scan ID %d before deleting the folder...", scanID)
+			time.Sleep(5 * time.Second) // Wait for 5 seconds before checking again
+		} else {
+			log.Info().Msgf("DDA is not running for scan ID %d, proceeding to delete the folder.", scanID)
+			break
+		}
+	}
+
+	if err := os.RemoveAll(DDAScanIDPath); err != nil {
+		return fmt.Errorf("error in deleting DDA folder for scan ID %d: %w", scanID, err)
+	}
+
+	log.Info().Msgf("DDA folder for scan ID %d deleted successfully.", scanID)
 	return nil
 }
 
@@ -7258,25 +7451,28 @@ func fetchDdaList(scanID int) (*ddaListResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetch DDA list: %w", err)
 	}
+
 	var payload ddaListResponse
 	if err := json.Unmarshal(body.Bytes(), &payload); err != nil {
 		return nil, fmt.Errorf("decode DDA list JSON: %w", err)
 	}
+
 	return &payload, nil
 }
 
 // 2. Pause the agent if it’s running; return true if we paused it
-func ensureAgentPaused() (bool, error) {
+func ensureAgentPaused(scanID int) (bool, error) {
 	running, err := isDDARunning()
 	if err != nil {
-		return false, fmt.Errorf("check DDA running: %w", err)
+		return false, fmt.Errorf("error in checking if DDA is running: %w", err)
 	}
 	if !running {
 		return false, nil
 	}
 
-	cfgPath := filepath.Join(CymetricxPath, "dda-configurations.json")
-	cfg, err := readDDAConfigurationsFromFile()
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+	cfgPath := filepath.Join(DDAScanIDPath, "dda-configurations.json")
+	cfg, err := readDDAConfigurationsFromFile(cfgPath)
 	if err != nil {
 		return false, fmt.Errorf("read config: %w", err)
 	}
@@ -7289,13 +7485,32 @@ func ensureAgentPaused() (bool, error) {
 	return true, nil
 }
 
+func ensureAgentStopped(scanID int) error {
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+	cfgPath := filepath.Join(DDAScanIDPath, "dda-configurations.json")
+	cfg, err := readDDAConfigurationsFromFile(cfgPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg.ScanStatus = "STOP"
+
+	raw, _ := json.Marshal(cfg)
+	if err := createFileWithPermissionsAndWriteToItRaw(cfgPath, raw, 0644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
+}
+
 // 3. Resume the agent if we paused it
-func resumeAgentIfNeeded(wasRunning bool) {
+func resumeAgentIfNeeded(scanID int, wasRunning bool) {
 	if !wasRunning {
 		return
 	}
-	cfgPath := filepath.Join(CymetricxPath, "dda-configurations.json")
-	cfg, err := readDDAConfigurationsFromFile()
+
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+
+	cfgPath := filepath.Join(DDAScanIDPath, "dda-configurations.json")
+	cfg, err := readDDAConfigurationsFromFile(cfgPath)
 	if err != nil {
 		log.Error().Err(err).Msg("read config for resume")
 		return
@@ -7309,7 +7524,7 @@ func resumeAgentIfNeeded(wasRunning bool) {
 }
 
 // 4a. Bulk‐delete exact Paths from a table
-func bulkDeleteExactPaths(tx *sql.Tx, table string, paths []string) error {
+func bulkDeleteExactRecords(tx *sql.Tx, table string, column string, paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
@@ -7317,11 +7532,14 @@ func bulkDeleteExactPaths(tx *sql.Tx, table string, paths []string) error {
 	args := make([]interface{}, len(paths))
 	for i, p := range paths {
 		ph[i] = "?"
+		if strings.Contains(p, "--->") && table == "ScannedFiles" {
+			p = strings.TrimSpace(strings.Split(p, "--->")[0])
+		}
 		args[i] = p
 	}
 	query := fmt.Sprintf(
-		"DELETE FROM %s WHERE Path IN (%s)",
-		table, strings.Join(ph, ","),
+		"DELETE FROM %s WHERE %s IN (%s)",
+		table, column, strings.Join(ph, ","),
 	)
 	if _, err := tx.Exec(query, args...); err != nil {
 		return fmt.Errorf("bulk delete from %s: %w", table, err)
@@ -7330,47 +7548,30 @@ func bulkDeleteExactPaths(tx *sql.Tx, table string, paths []string) error {
 }
 
 // 4b. Bulk‐delete folder prefixes via OR‐joined LIKE
-func bulkDeleteFolderPrefixes(tx *sql.Tx, table string, folders []string) error {
+// bulkDeleteLikeRecords finds all rows whose column LIKE any of the given folders,
+// returns their Path values, and then deletes them.
+func bulkDeleteLikeRecords(tx *sql.Tx, table, column string, folders []string) ([]string, error) {
 	if len(folders) == 0 {
-		return nil
+		return nil, nil
 	}
+
+	// Build the WHERE clause and args exactly as before
 	clauses := make([]string, len(folders))
 	args := make([]interface{}, len(folders))
 	for i, f := range folders {
-		clauses[i] = "Path LIKE ?"
+		clauses[i] = fmt.Sprintf("%s LIKE ?", column)
+		if strings.Contains(f, "--->") && table == "ScannedFiles" {
+			f = strings.TrimSpace(strings.Split(f, "--->")[0])
+		}
 		args[i] = f + "%"
 	}
-	query := fmt.Sprintf(
-		"DELETE FROM %s WHERE %s",
-		table, strings.Join(clauses, " OR "),
-	)
-	if _, err := tx.Exec(query, args...); err != nil {
-		return fmt.Errorf("bulk delete folders from %s: %w", table, err)
-	}
-	return nil
-}
+	where := strings.Join(clauses, " OR ")
 
-// 4c. Fetch DISTINCT Paths by RegexID, then bulk‐delete them
-func bulkDeleteRegexPaths(tx *sql.Tx, regexIDs []int) error {
-	if len(regexIDs) == 0 {
-		return nil
-	}
-
-	// 4c-i: collect file paths
-	ph := make([]string, len(regexIDs))
-	args := make([]interface{}, len(regexIDs))
-	for i, id := range regexIDs {
-		ph[i] = "?"
-		args[i] = id
-	}
-	query := fmt.Sprintf(
-		"SELECT DISTINCT Path FROM SensitiveData WHERE RegexID IN (%s)",
-		strings.Join(ph, ","),
-	)
-
-	rows, err := tx.Query(query, args...)
+	// 1) Select the Paths we're about to delete
+	selectQuery := fmt.Sprintf("SELECT DISTINCT Path FROM %s WHERE %s", table, where)
+	rows, err := tx.Query(selectQuery, args...)
 	if err != nil {
-		return fmt.Errorf("query regex paths: %w", err)
+		return nil, fmt.Errorf("select paths to delete from %s: %w", table, err)
 	}
 	defer rows.Close()
 
@@ -7378,20 +7579,96 @@ func bulkDeleteRegexPaths(tx *sql.Tx, regexIDs []int) error {
 	for rows.Next() {
 		var p string
 		if err := rows.Scan(&p); err != nil {
-			return fmt.Errorf("scan regex path: %w", err)
+			return nil, fmt.Errorf("scan path: %w", err)
 		}
 		paths = append(paths, p)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate regex rows: %w", err)
+		return nil, fmt.Errorf("iterate paths: %w", err)
 	}
 
-	// 4c-ii: delete them from both tables
-	if err := bulkDeleteExactPaths(tx, "SensitiveData", paths); err != nil {
-		return err
+	// 2) Now delete them
+	deleteQuery := fmt.Sprintf("DELETE FROM %s WHERE %s", table, where)
+	if _, err := tx.Exec(deleteQuery, args...); err != nil {
+		return nil, fmt.Errorf("bulk delete folders from %s: %w", table, err)
 	}
-	if err := bulkDeleteExactPaths(tx, "ScannedFiles", paths); err != nil {
-		return err
+
+	return paths, nil
+}
+
+// bulkDeleteByValues fetches DISTINCT paths where `column` IN (values...)
+// and then bulk-deletes those paths from both SensitiveData and ScannedFiles.
+func bulkDeleteByValues[T comparable](tx *sql.Tx, column string, values []T) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+
+	// build placeholders and args
+	ph := make([]string, len(values))
+	args := make([]interface{}, len(values))
+	for i, v := range values {
+		ph[i] = "?"
+		args[i] = v
+	}
+
+	// fetch distinct paths
+	query := fmt.Sprintf(
+		"SELECT DISTINCT Path FROM SensitiveData WHERE %s IN (%s)",
+		column, strings.Join(ph, ","),
+	)
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query paths by %s: %w", column, err)
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("scan path: %w", err)
+		}
+		paths = append(paths, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate path rows: %w", err)
+	}
+
+	// delete from both tables
+	if err := bulkDeleteExactRecords(tx, "SensitiveData", "Path", paths); err != nil {
+		return nil, err
+	}
+	if err := bulkDeleteExactRecords(tx, "ScannedFiles", "Path", paths); err != nil {
+		return nil, err
+	}
+
+	return paths, nil
+}
+
+func addDeletedFilePathsToDeletedFilesToBeScannedTable(tx *sql.Tx, filePaths []string) error {
+	if len(filePaths) == 0 {
+		return nil // nothing to do
+	}
+
+	// Build a "(?)" placeholder for each path
+	placeholders := make([]string, len(filePaths))
+	args := make([]interface{}, len(filePaths))
+	for i, path := range filePaths {
+		placeholders[i] = "(?)"
+		if strings.Contains(path, "--->") {
+			path = strings.TrimSpace(strings.Split(path, "--->")[0])
+		}
+		args[i] = path
+	}
+
+	// e.g. "INSERT INTO DeletedFilesToBeScanned (Path) VALUES (?), (?), (?), …"
+	query := fmt.Sprintf(
+		"INSERT INTO DeletedFilesToBeScanned (Path) VALUES %s",
+		strings.Join(placeholders, ", "),
+	)
+
+	if _, err := tx.Exec(query, args...); err != nil {
+		return fmt.Errorf("bulk insert into DeletedFilesToBeScanned: %w", err)
 	}
 
 	return nil
@@ -7402,7 +7679,9 @@ func monitorProgressFileAndUploadProgress(scanID int, callOnce bool) {
 
 	log.Info().Msg("Starting to monitor dda-progress.json file for changes...")
 
-	filePath := filepath.Join(CymetricxPath, "dda-progress.json")
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+
+	filePath := filepath.Join(DDAScanIDPath, "dda-progress.json")
 
 	nowTime := time.Now()
 
@@ -7453,7 +7732,7 @@ func monitorProgressFileAndUploadProgress(scanID int, callOnce bool) {
 		}
 
 		// Retrieve progress data as JSON.
-		progressStruct, err := getProgressTableAsJsonFromDDADB()
+		progressStruct, err := getProgressTableAsJsonFromDDADB(scanID)
 		if err != nil {
 			log.Error().Err(err).Msg("Error while getting progress table as JSON from DDA DB")
 		}
@@ -7479,7 +7758,9 @@ func monitorProgressFileAndUploadDDASensitiveData(scanID int) {
 	defer catchPanic()
 
 	log.Info().Msg("Starting to monitor dda-progress.json for DDA sensitive data uploads…")
-	filePath := filepath.Join(CymetricxPath, "dda-progress.json")
+
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+	filePath := filepath.Join(DDAScanIDPath, "dda-progress.json")
 
 	// Initialize our “last upload” markers
 	lastUploadTime := time.Now()
@@ -7493,7 +7774,7 @@ func monitorProgressFileAndUploadDDASensitiveData(scanID int) {
 			continue
 		}
 
-		progressStruct, err := getProgressTableAsJsonFromDDADB()
+		progressStruct, err := getProgressTableAsJsonFromDDADB(scanID)
 		if err != nil {
 			log.Error().Err(err).Msg("failed to load progress from DDA DB")
 			continue
@@ -7589,15 +7870,15 @@ func compressAndUploadSensitiveData(scanID int) error {
 	log.Info().Msg("Starting sensitive data CSV compression and upload process for DDA DB.")
 
 	// Retrieve sensitive data as CSV.
-	sensitiveDataCSVPath, err := getSenstiveDataTableAsCSVFromDDADB()
+	sensitiveDataCSVPath, err := getSenstiveDataTableAsCSVFromDDADB(scanID)
 	if err != nil {
 		return fmt.Errorf("error while getting sensitive data table as CSV from DDA DB: %w", err)
 	}
 
 	// Construct zip filename and file path.
-	zipFileName := fmt.Sprintf("dda_%s.zip", id)
+	zipFileName := fmt.Sprintf("dda_%d_%s.zip", scanID, id)
 	zipFilePath := filepath.Join(CymetricxPath, "Compressed Files", zipFileName)
-	sensitiveDataCSVDestinationName := fmt.Sprintf("dda_%s_sensitive_data.csv", id)
+	sensitiveDataCSVDestinationName := fmt.Sprintf("dda_%d_%s_sensitive_data.csv", scanID, id)
 
 	// Map source file to destination inside the zip (here we keep the same name).
 	srcToDstMap := map[string]string{
@@ -7628,7 +7909,7 @@ func uploadProgressData(scanID int, ddaError error) error {
 	log.Info().Msg("Starting progress JSON upload process for DDA DB.")
 
 	// Retrieve progress data as JSON.
-	progressStruct, err := getProgressTableAsJsonFromDDADB()
+	progressStruct, err := getProgressTableAsJsonFromDDADB(scanID)
 	if err != nil {
 		return fmt.Errorf("error while getting progress table as JSON from DDA DB: %w", err)
 	}
@@ -7649,7 +7930,10 @@ func uploadProgressData(scanID int, ddaError error) error {
 	}
 
 	// Update dda-progress.json file with the current progress.
-	progressFilePath := filepath.Join(CymetricxPath, "dda-progress.json")
+
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+	progressFilePath := filepath.Join(DDAScanIDPath, "dda-progress.json")
+
 	if err := createFileWithPermissionsAndWriteToItRaw(progressFilePath, progressStructBytes, 0644); err != nil {
 		return fmt.Errorf("error in creating file and writing to it: %w", err)
 	}
@@ -7669,10 +7953,11 @@ func uploadProgressData(scanID int, ddaError error) error {
 	return nil
 }
 
-func getSenstiveDataTableAsCSVFromDDADB() (string, error) {
-	dbPath := filepath.Join(CymetricxPath, "dda.db")
+func getSenstiveDataTableAsCSVFromDDADB(scanID int) (string, error) {
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+	dbPath := filepath.Join(DDAScanIDPath, "dda.db")
 	tableName := "SensitiveData"
-	sensitiveDataCSVPath := filepath.Join(CymetricxPath, "sensitive-data.csv")
+	sensitiveDataCSVPath := filepath.Join(DDAScanIDPath, "sensitive-data.csv")
 
 	sensitiveDataCSVPath, err := exportTableToCSV(dbPath, tableName, sensitiveDataCSVPath)
 	if err != nil {
@@ -7692,10 +7977,12 @@ type DdaProgress struct {
 	Status                 string  `json:"Status"`
 }
 
-func getProgressTableAsJsonFromDDADB() (DdaProgress, error) {
+func getProgressTableAsJsonFromDDADB(scanID int) (DdaProgress, error) {
 	var progress DdaProgress
 
-	progressJSONPath := filepath.Join(CymetricxPath, "dda-progress.json")
+	DDAScanIDPath := filepath.Join(CymetricxPath, "DDA-Scans", fmt.Sprintf("ScanID-%d", scanID))
+
+	progressJSONPath := filepath.Join(DDAScanIDPath, "dda-progress.json")
 
 	jsonContent, err := os.ReadFile(progressJSONPath)
 	if err != nil {
@@ -7742,10 +8029,9 @@ type DdaConfigurations struct {
 	}
 }
 
-func readDDAConfigurationsFromFile() (DdaConfigurations, error) {
-	configFilePath := filepath.Join(CymetricxPath, "dda-configurations.json")
+func readDDAConfigurationsFromFile(cfgPath string) (DdaConfigurations, error) {
 	var configurations DdaConfigurations
-	jsonContent, err := os.ReadFile(configFilePath)
+	jsonContent, err := os.ReadFile(cfgPath)
 	if err != nil {
 		return DdaConfigurations{}, fmt.Errorf("error reading DDA configurations file: %w", err)
 	}
@@ -12969,7 +13255,8 @@ type ApiRealTimeRedisResponse struct {
 	DdaScanIncidents bool `json:"ddaScanIncidents"` // Call the DDA agent with incidents
 	ScanID           int  `json:"scanID"`           // The ID of the scan to call the DDA agent
 
-	DdaDelete bool `json:"ddaDelete"`
+	DdaDelete   bool `json:"ddaDelete"`
+	DdaDeleteDB bool `json:"ddaDeleteDB"` // Delete the DDA database
 }
 
 func initRedis(iniData ini.IniConfig) *redis.Client {
@@ -13183,6 +13470,12 @@ func processRealTimeRedisInstructions(responseBody ApiRealTimeRedisResponse, ser
 
 	if responseBody.DdaDelete {
 		if err := deleteDdaRecords(responseBody.ScanID); err != nil {
+			log.Error().Err(err).Msg("Failed to delete DDD list.")
+		}
+	}
+
+	if responseBody.DdaDeleteDB {
+		if err := deleteDdaFolder(responseBody.ScanID); err != nil {
 			log.Error().Err(err).Msg("Failed to delete DDD list.")
 		}
 	}
